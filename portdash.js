@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * PortDash — 本地开发服务可视化控制台
+ * PortDash — a visual control panel for local dev servers
  *
- * 零依赖单文件。运行:  node portdash.js
- * 然后打开:            http://localhost:7777
+ * Zero dependencies, single file. Run:  node portdash.js
+ * Then open:                            http://localhost:7777
  *
- * 配置与数据都在 ~/.portdash/ 下:
- *   config.json    扫描目录、UI 端口、内存限额
- *   projects.json  项目登记表（扫描生成，可在界面上改）
- *   state.json     由 PortDash 拉起的进程记录
- *   logs/          每个项目的运行日志
+ * Config and data live under ~/.portdash/:
+ *   config.json    scan roots, UI port, memory limits
+ *   projects.json  the project registry (built by scanning, editable in the UI)
+ *   state.json     bookkeeping for processes PortDash itself started
+ *   logs/          per-project run logs
  */
 
 const http = require('http');
@@ -37,20 +37,20 @@ const DEFAULT_CFG = {
   ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'out', '.next', '.nuxt',
                'vendor', '.venv', 'venv', '__pycache__', 'target', '.cache', 'coverage'],
 
-  // ------- 内存保护。想更宽松就把数字调大，想关掉把 enabled 设 false -------
+  // ------- Memory protection. Raise the numbers to loosen it, or set enabled:false to turn it off -------
   limits: {
     enabled: true,
-    projectRssMB: 4096,        // 单个项目（整个进程组）占用超过这个 → 自动冻结
-    hardRssMB: 10240,          // 超过这个 → 直接强杀，不再客气
-    nodeHeapMB: 3072,          // 给 node 注入 --max-old-space-size，让它自己 OOM 而不是拖垮系统
-    sysAvailFloorPct: 12,      // 系统可用内存低于这个百分比 → 冻结当前最占内存的项目
-    sysSwapCeilMB: 4096,       // swap 用量超过这个 → 同上
-    startBurst: 3,             // 60 秒内同一个项目最多启动几次（防崩溃重启循环）
-    logMaxMB: 5                // 启动时日志超过这个就先归档
+    projectRssMB: 4096,        // a single project (whole process group) over this → auto-freeze
+    hardRssMB: 10240,          // over this → kill it outright, no more mercy
+    nodeHeapMB: 3072,          // injected as --max-old-space-size so node OOMs itself instead of taking down the box
+    sysAvailFloorPct: 12,      // system available memory below this % → freeze the biggest offender
+    sysSwapCeilMB: 4096,       // swap usage above this → same as above
+    startBurst: 3,             // max starts per project within 60s (guards against crash-restart loops)
+    logMaxMB: 5                // rotate the log to .old if it's already bigger than this at startup
   }
 };
 
-// ---------------------------------------------------------------- 基础工具
+// ---------------------------------------------------------------- basics
 
 function ensure() {
   fs.mkdirSync(ROOT, { recursive: true });
@@ -105,10 +105,10 @@ const setReg = (r) => writeJSON(F_REG, r);
 let managed = readJSON(F_STATE, {});
 const saveManaged = () => writeJSON(F_STATE, managed);
 
-// ---------------------------------------------------------------- 告警
+// ---------------------------------------------------------------- alerts
 
 let alerts = [];
-const alertSeen = {};                 // 同一类告警 60 秒内不重复刷屏
+const alertSeen = {};                 // don't flood with the same alert more than once per 60s
 function alert_(level, text, projectId, key) {
   const k = key || (level + ':' + text);
   const now = Date.now();
@@ -116,7 +116,7 @@ function alert_(level, text, projectId, key) {
   alertSeen[k] = now;
   alerts.unshift({ id: crypto.randomBytes(4).toString('hex'), t: now, level, text, projectId });
   alerts = alerts.slice(0, 20);
-  console.log(`[${level === 'danger' ? '干预' : '提醒'}] ${text}`);
+  console.log(`[${level === 'danger' ? 'action' : 'notice'}] ${text}`);
   if (projectId) {
     try {
       fs.appendFileSync(path.join(D_LOGS, projectId + '.log'),
@@ -125,7 +125,7 @@ function alert_(level, text, projectId, key) {
   }
 }
 
-// ---------------------------------------------------------------- 项目扫描
+// ---------------------------------------------------------------- project scanning
 
 function detectProject(dir) {
   const has = (f) => fs.existsSync(path.join(dir, f));
@@ -143,7 +143,8 @@ function detectProject(dir) {
   if (has('manage.py')) return { name: path.basename(dir), cmd: 'python3 manage.py runserver', kind: 'django' };
   if (has('pyproject.toml') || has('requirements.txt')) return { name: path.basename(dir), cmd: '', kind: 'python' };
   if (has('index.html')) {
-    // 弱匹配：根目录有 index.html 也算一个可预览的静态站，但仍继续往下找真正的子项目
+    // Weak match: a root-level index.html also counts as a previewable static site,
+    // but we keep walking below it looking for a "real" sub-project.
     return { name: path.basename(dir), cmd: 'python3 -m http.server 8000', kind: 'static', weak: true };
   }
   return null;
@@ -158,7 +159,7 @@ function walk(dir, depth, cfg, out) {
     const p = detectProject(dir);
     if (p) {
       out.push(Object.assign({}, p, { cwd: dir }));
-      if (!p.weak) return;                 // 强匹配命中后不再往下钻
+      if (!p.weak) return;                 // stop drilling down once we get a strong match
     }
   }
   for (const it of items) {
@@ -178,7 +179,7 @@ function scanProjects() {
   const known = new Set(reg.map((p) => p.cwd));
   let added = 0;
   for (const f of found) {
-    if (known.has(f.cwd)) continue;        // 已登记的不覆盖（保留你改过的命令和限额）
+    if (known.has(f.cwd)) continue;        // never overwrite an already-registered project (keeps your edits)
     reg.push({ id: idOf(f.cwd), name: f.name, cwd: f.cwd, cmd: f.cmd, kind: f.kind,
                port: null, memMB: null, heapMB: null });
     added++;
@@ -187,7 +188,7 @@ function scanProjects() {
   return { total: reg.length, added };
 }
 
-// ---------------------------------------------------------------- 系统探测
+// ---------------------------------------------------------------- system inspection
 
 function listeners() {
   const out = run('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN']);
@@ -211,7 +212,7 @@ function listeners() {
   return rows;
 }
 
-/** 一次拿全系统进程表，得到 pid→信息 与 pgid→内存合计（MB） */
+/** One pass over the whole process table: pid → info, and pgid → total RSS (MB) */
 function processTable() {
   const out = run('ps', ['-Ao', 'pid=,pgid=,rss=,stat=,etime=,command=']);
   const byPid = {}, rssByPgid = {};
@@ -237,7 +238,8 @@ function cwdInfo(pids) {
   return map;
 }
 
-/** 系统内存水位。任何一步解析失败都返回 null —— 看门狗宁可不动，也不能误判 */
+/** System memory pressure. Any parse failure returns null — the watchdog would rather
+    do nothing than act on a bad reading. */
 function sysMem() {
   try {
     if (IS_MAC) {
@@ -276,7 +278,7 @@ function sysMem() {
 
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return false; } };
 
-// ---------------------------------------------------------------- 状态汇总
+// ---------------------------------------------------------------- state aggregation
 
 function buildState() {
   const cfg = getCfg();
@@ -337,15 +339,15 @@ function buildState() {
   return { projects, others, alerts, sys: sysMem(), limits: cfg.limits, now: Date.now() };
 }
 
-// ---------------------------------------------------------------- 进程控制
+// ---------------------------------------------------------------- process control
 
 function signalGroup(pgid, sig) {
   try { process.kill(-pgid, sig); return true; } catch (e) { /* fall through */ }
   try { process.kill(pgid, sig); return true; } catch (e) { return false; }
 }
 
-const starting = new Set();          // 正在启动中的项目，防连点
-const startLog = {};                 // id → 最近的启动时间戳，防崩溃重启循环
+const starting = new Set();          // projects currently starting up, guards against double-clicks
+const startLog = {};                 // id → recent start timestamps, guards against crash-restart loops
 
 function rotateLog(file, maxMB) {
   try {
@@ -358,37 +360,39 @@ function rotateLog(file, maxMB) {
 function startProject(id) {
   const lim = getCfg().limits;
   const p = getReg().find((x) => x.id === id);
-  if (!p) throw new Error('项目不存在');
-  if (!p.cmd) throw new Error('这个项目还没配启动命令，点「编辑」填一个（比如 npm run dev）');
-  if (!fs.existsSync(p.cwd)) throw new Error('目录不存在：' + p.cwd);
+  if (!p) throw new Error('Project not found');
+  if (!p.cmd) throw new Error('No start command configured for this project — click "Edit" and set one (e.g. npm run dev)');
+  if (!fs.existsSync(p.cwd)) throw new Error('Directory does not exist: ' + p.cwd);
 
-  // --- 防连点：界面 2.5 秒才刷新一次，连点两下会真的起两份 ---
-  if (starting.has(id)) throw new Error('正在启动中，等一下');
+  // --- Guard against double-clicks: the UI only refreshes every 2.5s, so two quick clicks
+  //     would otherwise really start two instances ---
+  if (starting.has(id)) throw new Error('Already starting, hang on');
 
-  // --- 起之前重新确认一次实际状态，而不是信任缓存 ---
+  // --- Re-check real state right before starting instead of trusting the cache ---
   const cur = buildState().projects.find((x) => x.id === id);
-  if (cur && cur.pid) throw new Error(`已经在跑了（pid ${cur.pid}），要重来请点「重启」`);
+  if (cur && cur.pid) throw new Error(`Already running (pid ${cur.pid}) — use "Restart" instead`);
 
-  // --- 防崩溃重启循环：起不来的项目被反复拉起，是最典型的内存雪崩 ---
+  // --- Guard against crash-restart loops: a project that keeps failing to start and gets
+  //     retried is the classic path to a memory avalanche ---
   const now = Date.now();
   startLog[id] = (startLog[id] || []).filter((t) => now - t < 60000);
   if (lim.enabled && startLog[id].length >= lim.startBurst) {
-    throw new Error(`1 分钟内已经启动 ${lim.startBurst} 次了。先点「日志」看它为什么起不来，别再硬拉`);
+    throw new Error(`Already started ${lim.startBurst} times in the last minute. Check "Logs" to see why it won't come up instead of forcing it again`);
   }
 
-  // --- 系统内存已经紧张时，不许再起新服务 ---
+  // --- Refuse to start anything new while the system is already tight on memory ---
   const sm = sysMem();
   if (lim.enabled && sm && sm.availPct < lim.sysAvailFloorPct) {
-    throw new Error(`系统可用内存只剩 ${sm.availPct}%，先停掉点东西再启动`);
+    throw new Error(`Only ${sm.availPct}% memory available — stop something first`);
   }
 
   ensure();
   const logFile = path.join(D_LOGS, id + '.log');
   rotateLog(logFile, lim.logMaxMB);
   const fd = fs.openSync(logFile, 'a');
-  fs.writeSync(fd, `\n===== ${new Date().toLocaleString()}  启动: ${p.cmd} =====\n`);
+  fs.writeSync(fd, `\n===== ${new Date().toLocaleString()}  start: ${p.cmd} =====\n`);
 
-  // --- 给 node 套堆上限：让它自己 OOM 退出，而不是把系统内存吃光 ---
+  // --- Cap node's heap so it OOMs itself instead of taking the whole system down ---
   const env = Object.assign({}, process.env, { FORCE_COLOR: '0' });
   const heap = p.heapMB || lim.nodeHeapMB;
   if (lim.enabled && heap && !/max-old-space-size/.test(env.NODE_OPTIONS || '')) {
@@ -397,7 +401,7 @@ function startProject(id) {
 
   const child = spawn(SHELL, ['-lc', p.cmd], {
     cwd: p.cwd,
-    detached: true,                  // 自成进程组，信号能覆盖整棵子进程树
+    detached: true,                  // its own process group, so signals reach the whole child tree
     stdio: ['ignore', fd, fd],
     env
   });
@@ -417,13 +421,13 @@ function resolveTarget(body) {
     return { pid: +body.pid, pgid: t ? t.pgid : +body.pid };
   }
   const st = buildState().projects.find((p) => p.id === body.id);
-  if (!st || !st.pid) throw new Error('这个项目当前没在运行');
+  if (!st || !st.pid) throw new Error('This project is not currently running');
   return { pid: st.pid, pgid: st.pgid };
 }
 
 function stopTarget(body) {
   const { pid, pgid } = resolveTarget(body);
-  signalGroup(pgid, 'SIGCONT');            // 先解冻，否则被冻住的进程收不到 TERM
+  signalGroup(pgid, 'SIGCONT');            // thaw first, or a frozen process never sees the TERM
   signalGroup(pgid, 'SIGTERM');
   setTimeout(() => { if (alive(pid)) signalGroup(pgid, 'SIGKILL'); }, 3000);
   if (body.id) { delete managed[body.id]; saveManaged(); }
@@ -445,11 +449,11 @@ async function restartProject(id) {
     if (alive(st.pid)) { signalGroup(st.pgid, 'SIGKILL'); await waitGone(st.pid, 2000); }
     delete managed[id]; saveManaged();
   }
-  await new Promise((r) => setTimeout(r, 500));   // 给端口一点释放时间
+  await new Promise((r) => setTimeout(r, 500));   // give the port a moment to actually free up
   return startProject(id);
 }
 
-// ---------------------------------------------------------------- 内存看门狗
+// ---------------------------------------------------------------- memory watchdog
 
 function watchdog() {
   const lim = getCfg().limits;
@@ -472,24 +476,25 @@ function watchdog() {
     });
   }
 
-  // 1) 单项目硬上限 → 直接强杀
+  // 1) hard per-project limit → kill outright
   for (const r of running) {
     if (r.rss > lim.hardRssMB) {
       signalGroup(r.pgid, 'SIGKILL');
       delete managed[r.id]; saveManaged();
-      alert_('danger', `「${r.name}」吃到 ${fmtMB(r.rss)}，超过硬上限 ${fmtMB(lim.hardRssMB)}，已强制停止。`, r.id, 'hard:' + r.id);
+      alert_('danger', `"${r.name}" hit ${fmtMB(r.rss)}, over the hard limit of ${fmtMB(lim.hardRssMB)} — force-stopped.`, r.id, 'hard:' + r.id);
     }
   }
 
-  // 2) 单项目软上限 → 冻结（保留现场，你可以先看日志再决定）
+  // 2) soft per-project limit → freeze (preserves the crash scene so you can inspect logs before deciding)
   for (const r of running) {
     if (!r.paused && r.rss > r.limit && r.rss <= lim.hardRssMB) {
       signalGroup(r.pgid, 'SIGSTOP');
-      alert_('danger', `「${r.name}」内存到了 ${fmtMB(r.rss)}，超过限额 ${fmtMB(r.limit)}，已自动冻结。进程还在，看完日志可以「恢复」或「停止」。`, r.id, 'soft:' + r.id);
+      alert_('danger', `"${r.name}" reached ${fmtMB(r.rss)}, over its limit of ${fmtMB(r.limit)} — auto-frozen. The process is still there; check the logs, then "Resume" or "Stop".`, r.id, 'soft:' + r.id);
     }
   }
 
-  // 3) 系统水位 → 冻结当前最占内存的那个（只动 PortDash 自己起的，别人的只提醒）
+  // 3) system-wide pressure → freeze whoever's using the most (only touches processes PortDash
+  //    itself started; anything else just gets a warning)
   const sm = sysMem();
   if (!sm) return;
   const low = sm.availPct < lim.sysAvailFloorPct;
@@ -497,12 +502,12 @@ function watchdog() {
   if (!low && !swapping) return;
 
   const victim = running.filter((r) => !r.paused).sort((a, b) => b.rss - a.rss)[0];
-  const why = low ? `系统可用内存只剩 ${sm.availPct}%` : `swap 已用 ${fmtMB(sm.swapUsedMB)}`;
+  const why = low ? `only ${sm.availPct}% memory available` : `swap usage at ${fmtMB(sm.swapUsedMB)}`;
   if (victim) {
     signalGroup(victim.pgid, 'SIGSTOP');
-    alert_('danger', `${why}，已冻结当前最占内存的「${victim.name}」（${fmtMB(victim.rss)}）来保住系统。`, victim.id, 'sys:' + victim.id);
+    alert_('danger', `${why} — froze "${victim.name}" (${fmtMB(victim.rss)}), the biggest consumer, to protect the system.`, victim.id, 'sys:' + victim.id);
   } else {
-    alert_('warn', `${why}，但占内存的不是 PortDash 启动的进程，需要你自己处理。`, null, 'sys:none');
+    alert_('warn', `${why}, but the top consumer wasn't started by PortDash — you'll need to handle it yourself.`, null, 'sys:none');
   }
 }
 
@@ -520,8 +525,23 @@ const readBody = (req) => new Promise((resolve) => {
   req.on('end', () => { try { resolve(JSON.parse(s || '{}')); } catch (e) { resolve({}); } });
 });
 
+// Defends against a browser tab on any other page reaching this server:
+// - Host check blocks DNS-rebinding (attacker domain resolved to 127.0.0.1)
+// - Origin check blocks plain cross-site form/fetch requests
+// - the custom header can only be set by same-origin fetch, since a cross-origin
+//   request carrying it would need a CORS preflight this server never approves
+const LOCAL_HOST_RE = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+function isTrustedRequest(req) {
+  if (!LOCAL_HOST_RE.test(req.headers.host || '')) return false;
+  const origin = req.headers.origin;
+  if (origin && !LOCAL_HOST_RE.test(origin.replace(/^https?:\/\//, ''))) return false;
+  if (req.headers['x-portdash'] !== '1') return false;
+  return true;
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://localhost');
+  if (!LOCAL_HOST_RE.test(req.headers.host || '')) { res.writeHead(400); return res.end('bad host'); }
   try {
     if (u.pathname === '/') {
       const b = Buffer.from(HTML);
@@ -533,7 +553,7 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/logs') {
       const f = path.join(D_LOGS, path.basename(String(u.searchParams.get('id'))) + '.log');
-      let text = '（还没有日志。日志只在通过 PortDash 启动时才会记录。）';
+      let text = '(No logs yet. Logs are only recorded for services started through PortDash.)';
       if (fs.existsSync(f)) {
         const size = fs.statSync(f).size, cap = 200 * 1024;
         const len = Math.min(size, cap);
@@ -549,6 +569,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST') {
+      if (!isTrustedRequest(req)) { res.writeHead(403); return res.end('forbidden'); }
       const body = await readBody(req);
       if (u.pathname === '/api/scan')    return json(res, 200, scanProjects());
       if (u.pathname === '/api/start')   return json(res, 200, startProject(body.id));
@@ -561,7 +582,7 @@ const server = http.createServer(async (req, res) => {
       if (u.pathname === '/api/save') {
         const reg = getReg();
         const p = reg.find((x) => x.id === body.id);
-        if (!p) throw new Error('项目不存在');
+        if (!p) throw new Error('Project not found');
         if (typeof body.name === 'string' && body.name.trim()) p.name = body.name.trim();
         if (typeof body.cmd === 'string') p.cmd = body.cmd.trim();
         p.port = body.port ? parseInt(body.port, 10) : null;
@@ -571,9 +592,9 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true });
       }
       if (u.pathname === '/api/register') {
-        if (!body.cwd) throw new Error('拿不到这个进程的工作目录，没法登记');
+        if (!body.cwd) throw new Error("Couldn't determine this process's working directory, can't register it");
         const reg = getReg();
-        if (reg.some((x) => x.cwd === body.cwd)) throw new Error('这个目录已经登记过了');
+        if (reg.some((x) => x.cwd === body.cwd)) throw new Error('This directory is already registered');
         const d = detectProject(body.cwd) || { name: path.basename(body.cwd), cmd: '', kind: 'unknown' };
         reg.push({ id: idOf(body.cwd), name: d.name, cwd: body.cwd, cmd: d.cmd, kind: d.kind,
                    port: body.port || null, memMB: null, heapMB: null });
@@ -592,10 +613,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- 前端
+// ---------------------------------------------------------------- frontend
 
 const HTML = `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PortDash</title>
 <style>
@@ -604,7 +625,7 @@ const HTML = `<!doctype html>
 @media (prefers-color-scheme:dark){:root{--bg:#15171a;--card:#1d2024;--line:#2c3036;--tx:#e8eaed;--dim:#9aa1ab}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--tx);
-  font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif}
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Helvetica Neue",sans-serif}
 .wrap{max-width:1060px;margin:0 auto;padding:26px 20px 60px}
 header{display:flex;align-items:baseline;gap:13px;margin-bottom:18px;flex-wrap:wrap}
 h1{font-size:20px;margin:0;letter-spacing:-.2px}
@@ -657,38 +678,38 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 <div class="wrap">
   <header>
     <h1>PortDash</h1>
-    <span class="sub" id="stat">加载中…</span>
+    <span class="sub" id="stat">Loading…</span>
     <span class="spacer"></span>
     <span class="sub" id="sys"></span>
-    <button onclick="scan()">重新扫描</button>
+    <button onclick="scan()">Rescan</button>
   </header>
   <div id="alerts"></div>
-  <h2>我的项目</h2>
+  <h2>My projects</h2>
   <div id="projects"></div>
-  <h2>其他占用端口的进程</h2>
+  <h2>Other processes on listening ports</h2>
   <div id="others"></div>
 </div>
 
 <dialog id="edit">
-  <div style="font-weight:600;margin-bottom:4px">编辑项目</div>
+  <div style="font-weight:600;margin-bottom:4px">Edit project</div>
   <div class="sub" id="e_cwd" style="font-size:12px"></div>
-  <label>名称</label><input id="e_name">
-  <label>启动命令（在项目目录下执行）</label><input id="e_cmd" placeholder="npm run dev">
+  <label>Name</label><input id="e_name">
+  <label>Start command (runs in the project directory)</label><input id="e_cmd" placeholder="npm run dev">
   <div class="two">
-    <div><label>默认端口</label><input id="e_port" placeholder="可选"></div>
-    <div><label>内存上限 MB（超了自动冻结）</label><input id="e_mem" placeholder="留空用默认"></div>
-    <div><label>Node 堆上限 MB</label><input id="e_heap" placeholder="留空用默认"></div>
+    <div><label>Default port</label><input id="e_port" placeholder="optional"></div>
+    <div><label>Memory limit MB (auto-freeze past this)</label><input id="e_mem" placeholder="leave blank for default"></div>
+    <div><label>Node heap limit MB</label><input id="e_heap" placeholder="leave blank for default"></div>
   </div>
   <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px">
-    <button onclick="edit.close()">取消</button>
-    <button class="p" onclick="saveEdit()">保存</button>
+    <button onclick="edit.close()">Cancel</button>
+    <button class="p" onclick="saveEdit()">Save</button>
   </div>
 </dialog>
 
 <dialog id="logs">
   <div style="display:flex;align-items:center;margin-bottom:10px">
-    <div style="font-weight:600" id="l_title">日志</div><span class="spacer"></span>
-    <button onclick="logs.close()">关闭</button>
+    <div style="font-weight:600" id="l_title">Logs</div><span class="spacer"></span>
+    <button onclick="logs.close()">Close</button>
   </div>
   <pre id="l_body"></pre>
 </dialog>
@@ -703,16 +724,16 @@ function toast(m){
   document.body.appendChild(d); setTimeout(()=>d.remove(),5000);
 }
 async function api(p,b){
-  const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+  const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json','X-Portdash':'1'},body:JSON.stringify(b||{})});
   const j=await r.json().catch(()=>({}));
-  if(!r.ok){ toast(j.error||'操作失败'); throw new Error(j.error); }
+  if(!r.ok){ toast(j.error||'Action failed'); throw new Error(j.error); }
   return j;
 }
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const gb=mb=>mb>=1024?(mb/1024).toFixed(1)+'G':mb+'M';
 
 async function act(p,b){ await api(p,b); setTimeout(load,350); }
-async function scan(){ const r=await api('/api/scan'); toast('扫描完成，新增 '+r.added+' 个项目'); load(); }
+async function scan(){ const r=await api('/api/scan'); toast('Scan complete, '+r.added+' new project(s)'); load(); }
 function open_(port){ window.open('http://localhost:'+port,'_blank'); }
 
 function openEdit(p){
@@ -726,12 +747,12 @@ async function saveEdit(){
   edit.close(); load();
 }
 async function showLogs(p){
-  logId=p.id; l_title.textContent='日志 · '+p.name; l_body.textContent='读取中…'; logs.showModal();
+  logId=p.id; l_title.textContent='Logs · '+p.name; l_body.textContent='Loading…'; logs.showModal();
   l_body.textContent=await (await fetch('/api/logs?id='+encodeURIComponent(p.id))).text();
   l_body.scrollTop=l_body.scrollHeight;
 }
 async function remove(p){
-  if(!confirm('把「'+p.name+'」从登记表里删掉？（不会动你的项目文件）'))return;
+  if(!confirm('Remove "'+p.name+'" from the registry? (this won\\'t touch your project files)'))return;
   await act('/api/remove',{id:p.id});
 }
 
@@ -748,17 +769,17 @@ function memTag(rss,limit){
 }
 
 function projectRow(p){
-  const label={running:'运行中',paused:'已冻结',stopped:'未运行'}[p.status];
+  const label={running:'running',paused:'frozen',stopped:'stopped'}[p.status];
   const ports=p.ports.map(x=>'<span class="tag port">:'+x+'</span>').join('');
   let acts='';
-  if(p.status==='stopped') acts=btn('start',p.id,'启动','p');
+  if(p.status==='stopped') acts=btn('start',p.id,'Start','p');
   else if(p.status==='running')
-    acts=(p.openPort?'<button data-act="open" data-port="'+p.openPort+'">打开</button>':'')
-        +btn('pause',p.id,'暂停')+btn('restart',p.id,'重启')+btn('stop',p.id,'停止','d');
-  else acts=btn('resume',p.id,'恢复','p')+btn('stop',p.id,'停止','d');
-  acts+=btn('logs',p.id,'日志')+btn('edit',p.id,'编辑')+btn('remove',p.id,'×','d');
-  const badge=p.source==='external'?'<span class="tag">外部启动</span>':'';
-  const cmdTxt=p.cmd?esc(p.cmd):'<span style="color:var(--pause)">未配置启动命令</span>';
+    acts=(p.openPort?'<button data-act="open" data-port="'+p.openPort+'">Open</button>':'')
+        +btn('pause',p.id,'Pause')+btn('restart',p.id,'Restart')+btn('stop',p.id,'Stop','d');
+  else acts=btn('resume',p.id,'Resume','p')+btn('stop',p.id,'Stop','d');
+  acts+=btn('logs',p.id,'Logs')+btn('edit',p.id,'Edit')+btn('remove',p.id,'×','d');
+  const badge=p.source==='external'?'<span class="tag">external</span>':'';
+  const cmdTxt=p.cmd?esc(p.cmd):'<span style="color:var(--pause)">no start command configured</span>';
   const hot=(p.rssMB&&p.memLimit&&p.rssMB/p.memLimit>=.6)?' hot':'';
   return '<div class="row'+hot+'"><span class="dot '+p.status+'"></span><div class="main">'
     +'<div class="nm">'+esc(p.name)+ports+memTag(p.rssMB,p.memLimit)+badge+'</div>'
@@ -768,10 +789,10 @@ function projectRow(p){
 }
 
 function otherRow(o){
-  let acts='<button data-act="open" data-port="'+o.port+'">打开</button>'
-    +'<button data-act="'+(o.paused?'resume':'pause')+'" data-pid="'+o.pid+'">'+(o.paused?'恢复':'暂停')+'</button>'
-    +'<button class="d" data-act="stop" data-pid="'+o.pid+'">停止</button>';
-  if(o.cwd) acts+='<button data-act="register" data-cwd="'+esc(o.cwd)+'" data-port="'+o.port+'">登记</button>';
+  let acts='<button data-act="open" data-port="'+o.port+'">Open</button>'
+    +'<button data-act="'+(o.paused?'resume':'pause')+'" data-pid="'+o.pid+'">'+(o.paused?'Resume':'Pause')+'</button>'
+    +'<button class="d" data-act="stop" data-pid="'+o.pid+'">Stop</button>';
+  if(o.cwd) acts+='<button data-act="register" data-cwd="'+esc(o.cwd)+'" data-port="'+o.port+'">Register</button>';
   return '<div class="row"><span class="dot '+(o.paused?'paused':'running')+'"></span><div class="main">'
     +'<div class="nm">'+esc(o.command)+'<span class="tag port">:'+o.port+'</span>'
     +'<span class="tag">pid '+o.pid+'</span>'+(o.rssMB?'<span class="tag mem">'+gb(o.rssMB)+'</span>':'')+'</div>'
@@ -798,12 +819,12 @@ async function load(){
 
   const run=s.projects.filter(p=>p.status==='running').length;
   const pau=s.projects.filter(p=>p.status==='paused').length;
-  stat.textContent=s.projects.length+' 个项目 · '+run+' 个运行中'
-    +(pau?' · '+pau+' 个已冻结':'')+' · 另有 '+s.others.length+' 个端口被占用';
+  stat.textContent=s.projects.length+' project(s) · '+run+' running'
+    +(pau?' · '+pau+' frozen':'')+' · '+s.others.length+' other port(s) in use';
 
   if(s.sys){
     const c=s.sys.availPct<20?'var(--danger)':s.sys.availPct<35?'var(--pause)':'var(--dim)';
-    sys.innerHTML='<span style="color:'+c+'">内存可用 '+s.sys.availPct+'%</span>'
+    sys.innerHTML='<span style="color:'+c+'">'+s.sys.availPct+'% memory available</span>'
       +(s.sys.swapUsedMB>512?' · swap '+gb(s.sys.swapUsedMB):'');
   }
 
@@ -814,38 +835,38 @@ async function load(){
   projects.innerHTML = s.projects.length
     ? s.projects.slice().sort((a,b)=>ord[a.status]-ord[b.status]||a.name.localeCompare(b.name))
         .map(projectRow).join('')
-    : '<div class="empty">还没有登记任何项目。点右上角「重新扫描」，或改 ~/.portdash/config.json 里的 scanRoots。</div>';
+    : '<div class="empty">No projects registered yet. Click "Rescan" above, or edit scanRoots in ~/.portdash/config.json.</div>';
   others.innerHTML = s.others.length ? s.others.map(otherRow).join('')
-    : '<div class="empty">没有其他进程在监听端口。</div>';
+    : '<div class="empty">No other processes are listening on a port.</div>';
   if(logs.open&&logId) l_body.textContent=await (await fetch('/api/logs?id='+encodeURIComponent(logId))).text();
 }
 load(); setInterval(load,2500);
 </script></body></html>`;
 
-// ---------------------------------------------------------------- 启动
+// ---------------------------------------------------------------- boot
 
 ensure();
 if (!fs.existsSync(F_CFG)) writeJSON(F_CFG, DEFAULT_CFG);
-if (!fs.existsSync(F_REG)) console.log(`首次运行：扫描到 ${scanProjects().added} 个项目`);
+if (!fs.existsSync(F_REG)) console.log(`First run: found ${scanProjects().added} project(s)`);
 
 const cfg0 = getCfg();
-setInterval(watchdog, 2000);   // 2 秒一轮：太慢的话失控进程能在两次检查之间多吃好几个 G
+setInterval(watchdog, 2000);   // every 2s — any slower and a runaway process could eat several more GB in between checks
 
 server.listen(cfg0.uiPort, '127.0.0.1', () => {
   const sm = sysMem();
   console.log(`\n  PortDash → http://localhost:${cfg0.uiPort}\n`);
-  console.log(`  内存保护: ${cfg0.limits.enabled ? '开' : '关'}` +
+  console.log(`  Memory protection: ${cfg0.limits.enabled ? 'on' : 'off'}` +
     (cfg0.limits.enabled
-      ? `（单项目 ${cfg0.limits.projectRssMB}M 冻结 / ${cfg0.limits.hardRssMB}M 强杀，node 堆 ${cfg0.limits.nodeHeapMB}M）`
+      ? ` (freeze at ${cfg0.limits.projectRssMB}M / kill at ${cfg0.limits.hardRssMB}M per project, node heap ${cfg0.limits.nodeHeapMB}M)`
       : ''));
-  if (sm) console.log(`  当前系统: 可用 ${sm.availPct}% / 共 ${(sm.totalMB / 1024).toFixed(0)}G，swap 已用 ${sm.swapUsedMB}M`);
-  console.log(`  配置: ${F_CFG}`);
-  console.log(`  按 Ctrl+C 退出（不会影响已启动的服务）\n`);
+  if (sm) console.log(`  System: ${sm.availPct}% available of ${(sm.totalMB / 1024).toFixed(0)}G, swap used ${sm.swapUsedMB}M`);
+  console.log(`  Config: ${F_CFG}`);
+  console.log(`  Ctrl+C to quit (won't affect services already started)\n`);
 });
 
 server.on('error', (e) => {
   if (e.code === 'EADDRINUSE') {
-    console.error(`端口 ${cfg0.uiPort} 被占用了。改 ${F_CFG} 里的 uiPort 换一个。`);
+    console.error(`Port ${cfg0.uiPort} is already in use. Change uiPort in ${F_CFG}.`);
     process.exit(1);
   }
   throw e;
