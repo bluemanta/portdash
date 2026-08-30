@@ -1,8 +1,17 @@
 {
   "name": "@bluemanta/portdash",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A visual control panel for local dev servers — see every listening port, control it, and freeze (not kill) runaway memory before it takes the machine down.",
-  "keywords": ["dev-server", "localhost", "ports", "process-manager", "dashboard", "cli", "memory", "watchdog"],
+  "keywords": [
+    "dev-server",
+    "localhost",
+    "ports",
+    "process-manager",
+    "dashboard",
+    "cli",
+    "memory",
+    "watchdog"
+  ],
   "homepage": "https://github.com/bluemanta/portdash",
   "bugs": "https://github.com/bluemanta/portdash/issues",
   "repository": {
@@ -27,5 +36,8 @@
   "engines": {
     "node": ">=16"
   },
-  "os": ["darwin", "linux"]
+  "os": [
+    "darwin",
+    "linux"
+  ]
 }
