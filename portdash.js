@@ -278,6 +278,19 @@ function sysMem() {
 
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return false; } };
 
+// System daemons and sandboxed GUI apps report a cwd of "/" or somewhere under
+// ~/Library — registering those would just put a junk entry in the registry, so
+// don't offer it. Checked on the server too, not just hidden in the UI.
+const SYS_PREFIXES = ['/System', '/Library', '/usr', '/bin', '/sbin', '/opt', '/Applications', '/private'];
+function registrable(cwd) {
+  if (!cwd || cwd === '/' || cwd === HOME) return false;
+  if (!path.basename(cwd)) return false;
+  if (SYS_PREFIXES.some((p) => cwd === p || cwd.startsWith(p + '/'))) return false;
+  const lib = path.join(HOME, 'Library');
+  if (cwd === lib || cwd.startsWith(lib + '/')) return false;
+  return true;
+}
+
 // ---------------------------------------------------------------- state aggregation
 
 function buildState() {
@@ -323,18 +336,34 @@ function buildState() {
     });
   });
 
-  const others = L.filter((r) => !claimed.has(r.pid) && r.pid !== process.pid).map((r) => {
+  // Group unclaimed listeners by process group, the same way projects are grouped —
+  // one row per process, ports collected, so a process on several ports isn't listed
+  // repeatedly with its group memory counted once per port.
+  const otherByPgid = new Map();
+  for (const r of L) {
+    if (claimed.has(r.pid) || r.pid === process.pid) continue;
     const info = byPid[r.pid] || {};
-    const exe = (info.command || '').trim().split(/\s+/)[0];
-    return {
-      pid: r.pid, pgid: info.pgid || r.pid, port: r.port,
-      command: exe ? path.basename(exe) : r.command,
-      cmdline: info.command || '', etime: info.etime || '',
-      rssMB: Math.round(rssByPgid[info.pgid] || info.rssMB || 0),
-      cwd: C[r.pid] || '', cwdShort: C[r.pid] ? shorten(C[r.pid]) : '',
-      paused: !!(info.stat && info.stat.startsWith('T'))
-    };
-  }).sort((a, b) => a.port - b.port);
+    const pgid = info.pgid || r.pid;
+    let row = otherByPgid.get(pgid);
+    if (!row) {
+      const exe = (info.command || '').trim().split(/\s+/)[0];
+      const cwd = C[r.pid] || '';
+      row = {
+        pid: r.pid, pgid, ports: [],
+        command: exe ? path.basename(exe) : r.command,
+        cmdline: info.command || '', etime: info.etime || '',
+        rssMB: Math.round(rssByPgid[pgid] || info.rssMB || 0),
+        cwd, cwdShort: cwd ? shorten(cwd) : '',
+        registrable: registrable(cwd),
+        paused: !!(info.stat && info.stat.startsWith('T'))
+      };
+      otherByPgid.set(pgid, row);
+    }
+    if (!row.ports.includes(r.port)) row.ports.push(r.port);
+  }
+  const others = [...otherByPgid.values()]
+    .map((o) => { o.ports.sort((a, b) => a - b); return o; })
+    .sort((a, b) => a.ports[0] - b.ports[0]);
 
   return { projects, others, alerts, sys: sysMem(), limits: cfg.limits, now: Date.now() };
 }
@@ -593,6 +622,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (u.pathname === '/api/register') {
         if (!body.cwd) throw new Error("Couldn't determine this process's working directory, can't register it");
+        if (!registrable(body.cwd)) throw new Error(`${body.cwd} doesn't look like a project directory — it's a system or sandboxed-app path`);
         const reg = getReg();
         if (reg.some((x) => x.cwd === body.cwd)) throw new Error('This directory is already registered');
         const d = detectProject(body.cwd) || { name: path.basename(body.cwd), cmd: '', kind: 'unknown' };
@@ -789,12 +819,13 @@ function projectRow(p){
 }
 
 function otherRow(o){
-  let acts='<button data-act="open" data-port="'+o.port+'">Open</button>'
+  const ports=o.ports.map(x=>'<span class="tag port">:'+x+'</span>').join('');
+  let acts='<button data-act="open" data-port="'+o.ports[0]+'">Open</button>'
     +'<button data-act="'+(o.paused?'resume':'pause')+'" data-pid="'+o.pid+'">'+(o.paused?'Resume':'Pause')+'</button>'
     +'<button class="d" data-act="stop" data-pid="'+o.pid+'">Stop</button>';
-  if(o.cwd) acts+='<button data-act="register" data-cwd="'+esc(o.cwd)+'" data-port="'+o.port+'">Register</button>';
+  if(o.registrable) acts+='<button data-act="register" data-cwd="'+esc(o.cwd)+'" data-port="'+o.ports[0]+'">Register</button>';
   return '<div class="row"><span class="dot '+(o.paused?'paused':'running')+'"></span><div class="main">'
-    +'<div class="nm">'+esc(o.command)+'<span class="tag port">:'+o.port+'</span>'
+    +'<div class="nm">'+esc(o.command)+ports
     +'<span class="tag">pid '+o.pid+'</span>'+(o.rssMB?'<span class="tag mem">'+gb(o.rssMB)+'</span>':'')+'</div>'
     +'<div class="meta">'+esc(o.cwdShort||o.cmdline||'')+'</div></div>'
     +'<div class="acts">'+acts+'</div></div>';

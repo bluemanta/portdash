@@ -15,6 +15,9 @@
   "bin": {
     "portdash": "portdash.js"
   },
+  "scripts": {
+    "start": "node portdash.js"
+  },
   "files": [
     "portdash.js",
     "README.md",
