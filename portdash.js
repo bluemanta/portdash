@@ -49,7 +49,8 @@ const DEFAULT_CFG = {
     hardRssMB: 10240,          // over this → kill it outright, no more mercy
     nodeHeapMB: 3072,          // injected as --max-old-space-size so node OOMs itself instead of taking down the box
     sysAvailFloorPct: 12,      // system available memory below this % → freeze the biggest offender
-    sysSwapCeilMB: 4096,       // swap usage above this → same as above
+    sysSwapCeilMB: 4096,       // swap this high *while memory is also tight* counts as thrashing
+    minVictimMB: 1024,         // never freeze something smaller than this for system pressure — it wouldn't help
     startBurst: 3,             // max starts per project within 60s (guards against crash-restart loops)
     logMaxMB: 5,               // rotate the log to .old if it's already bigger than this at startup
     selfLogMaxMB: 2            // rotate PortDash's own log at this size (matters when running as an agent)
@@ -594,19 +595,31 @@ function watchdog() {
     }
   }
 
-  // 3) system-wide pressure → freeze whoever's using the most (only touches processes PortDash
-  //    itself started; anything else just gets a warning)
+  // 3) system-wide pressure → freeze whoever's using the most (only touches processes
+  //    PortDash itself started; anything else just gets a warning)
   const sm = sysMem();
   if (!sm) return;
+
+  // Free memory is the signal that actually matters. Swap usage on its own is not:
+  // macOS never gives swap back, so once anything has paged out the total stays high
+  // for the rest of the uptime. Treating that as an emergency means freezing something
+  // every 2 seconds on a machine that is perfectly healthy. Swap only counts as
+  // thrashing when memory is tight at the same time.
   const low = sm.availPct < lim.sysAvailFloorPct;
-  const swapping = sm.swapUsedMB > lim.sysSwapCeilMB;
-  if (!low && !swapping) return;
+  const thrashing = sm.swapUsedMB > lim.sysSwapCeilMB && sm.availPct < lim.sysAvailFloorPct * 2;
+  if (!low && !thrashing) return;
 
   const victim = running.filter((r) => !r.paused).sort((a, b) => b.rss - a.rss)[0];
-  const why = low ? `only ${sm.availPct}% memory available` : `swap usage at ${fmtMB(sm.swapUsedMB)}`;
-  if (victim) {
+  const why = low ? `only ${sm.availPct}% memory available`
+                  : `swap at ${fmtMB(sm.swapUsedMB)} with only ${sm.availPct}% memory available`;
+
+  // Freezing a process that isn't actually holding much won't give the system anything
+  // back — it just breaks the user's work for nothing.
+  if (victim && victim.rss >= lim.minVictimMB) {
     signalGroup(victim.pgid, 'SIGSTOP');
     alert_('danger', `${why} — froze "${victim.name}" (${fmtMB(victim.rss)}), the biggest consumer, to protect the system.`, victim.id, 'sys:' + victim.id);
+  } else if (victim) {
+    alert_('warn', `${why}, but the biggest thing PortDash started is only "${victim.name}" (${fmtMB(victim.rss)}) — freezing it wouldn't help, so it's been left alone.`, null, 'sys:small');
   } else {
     alert_('warn', `${why}, but the top consumer wasn't started by PortDash — you'll need to handle it yourself.`, null, 'sys:none');
   }
