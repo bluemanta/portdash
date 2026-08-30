@@ -44,6 +44,35 @@ Two caveats worth knowing:
   responding, which is confusing if you've forgotten something is watching. Check
   `~/.portdash/portdash.log` when a service goes unresponsive for no obvious reason.
 
+## macOS permissions (Full Disk Access, Photos, Contacts…)
+
+If a service works when you run it in Terminal but fails under PortDash with
+`Operation not permitted`, this is why.
+
+macOS grants privacy permissions to the *responsible process* — the app at the root of the
+launch chain — not to the binary doing the work. Child processes inherit that identity.
+Being detached and in its own process group does **not** break the inheritance; only the
+identity at the root matters.
+
+So the fix depends on how PortDash itself was started:
+
+| PortDash started from | Responsible process | What to do |
+|---|---|---|
+| Terminal.app / iTerm | that terminal | nothing — it inherits whatever you already granted the terminal |
+| Another app (an editor, an AI agent, a launcher) | that app | grant the permission to that app, or start PortDash from your terminal instead |
+| `--install-agent` | the `node` binary | grant the permission to `node` directly |
+
+Under the launch agent there's no terminal to inherit from, so grant it to Node itself:
+System Settings → Privacy & Security → Full Disk Access → `+` → <kbd>⌘⇧G</kbd> → the output of
+`which node`.
+
+Two things to weigh before doing that:
+
+- It grants that permission to **every** Node program you run, not just PortDash. That's a
+  wider grant than most people expect, and macOS offers no finer granularity here.
+- Use a stable interpreter path. A version-managed Node (nvm, asdf) changes path on every
+  upgrade, and the grant doesn't follow it.
+
 ## What it does
 
 - **See** every process listening on a port, grouped by project, with live memory usage per group
