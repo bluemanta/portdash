@@ -7,13 +7,36 @@
 ## 运行
 
 ```bash
-cd ~/Documents/CodeProjects/portdash
+npx @bluemanta/portdash
+```
+
+或者克隆下来直接跑：
+
+```bash
+git clone https://github.com/bluemanta/portdash.git
+cd portdash
 node portdash.js
 ```
 
 然后打开 http://localhost:7777
 
 也可以在访达里双击 `启动PortDash.command`。
+
+## 让看门狗常驻（可选）
+
+看门狗只在 PortDash 运行时才起作用。关掉它，你的 dev server 会继续跑——但没人看着。想让它常驻后台：
+
+```bash
+npm install -g @bluemanta/portdash
+portdash --install-agent
+```
+
+这会装一个 macOS LaunchAgent，开机自启、异常退出后自动重启。它**以你自己的身份运行，不是 root**——发信号给你的进程需要同一个用户，而 root 的权限远超它的实际需要。卸载用 `portdash --uninstall-agent`。
+
+两个需要知道的坑：
+
+- 它会记下安装时那个 `node` 的路径。如果那是 nvm 管的版本，之后你把该版本删了，agent 就废了——重装一次，或者指向一个稳定的 Node。
+- **被冻住的服务是安静的。** SIGSTOP 之后进程不崩溃、不报错，只是不响应，如果你忘了后台有东西在管着会很困惑。服务无缘无故没反应时，去看 `~/.portdash/portdash.log`。
 
 ## 它能做什么
 
@@ -49,12 +72,26 @@ node portdash.js
 | `config.json` | 扫描目录 `scanRoots`、界面端口 `uiPort`、扫描深度 `scanDepth`、内存限额 `limits` |
 | `projects.json` | 项目登记表。首次运行自动扫描生成，之后「重新扫描」只增不改 |
 | `state.json` | PortDash 拉起的进程记录 |
+| `token` | API 令牌，首次运行生成，权限 `0600` |
+| `portdash.log` | PortDash 自己的输出，超过 2M 自动轮转 |
 | `logs/` | 每个项目一个日志文件，启动时超过 5M 自动归档为 .old |
 
 启动命令是扫描时从 `package.json` 的 scripts 猜的（dev > start > serve），猜错了在界面上点「编辑」改掉，之后不会被覆盖。
+
+## 安全
+
+这个 API 能拉起进程，所以做了三层限制：`Host` 头必须是本地（挡 DNS 重绑定）、跨站 `Origin` 一律拒绝、所有 `/api/` 请求必须带上 `~/.portdash/token` 里的令牌（放在 `X-Portdash-Token` 头里）。前两层挡的是网页，令牌挡的是**本机其他进程**——常驻之后这一层才是关键。
+
+脚本调用的话：
+
+```bash
+curl -H "X-Portdash-Token: $(cat ~/.portdash/token)" http://localhost:7777/api/state
+```
 
 ## 注意
 
 - 关掉 PortDash 不会影响已经启动的服务，它们继续在后台跑；重开会重新认领它们
 - 看门狗只自动处置 PortDash 自己启动的进程，不会去动你手动跑的东西
+- pid 会被系统回收，所以一条记录只有在占用该 pid 的进程「年龄不小于记录本身」时才被信任，否则宁可丢弃，也不冒险对陌生进程发信号
+- 端口被占时它会等待重试而不是退出，而且只有抢到端口之后才启动看门狗，所以第二个实例不会和第一个抢着管同一批进程
 - 界面只监听 127.0.0.1，不对局域网开放

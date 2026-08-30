@@ -25,10 +25,15 @@ const ROOT = path.join(HOME, '.portdash');
 const F_CFG = path.join(ROOT, 'config.json');
 const F_REG = path.join(ROOT, 'projects.json');
 const F_STATE = path.join(ROOT, 'state.json');
+const F_TOKEN = path.join(ROOT, 'token');
+const F_SELFLOG = path.join(ROOT, 'portdash.log');
 const D_LOGS = path.join(ROOT, 'logs');
 
 const SHELL = process.env.SHELL || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash');
 const IS_MAC = process.platform === 'darwin';
+
+const AGENT_LABEL = 'com.bluemanta.portdash';
+const F_PLIST = path.join(HOME, 'Library', 'LaunchAgents', AGENT_LABEL + '.plist');
 
 const DEFAULT_CFG = {
   uiPort: 7777,
@@ -46,7 +51,8 @@ const DEFAULT_CFG = {
     sysAvailFloorPct: 12,      // system available memory below this % → freeze the biggest offender
     sysSwapCeilMB: 4096,       // swap usage above this → same as above
     startBurst: 3,             // max starts per project within 60s (guards against crash-restart loops)
-    logMaxMB: 5                // rotate the log to .old if it's already bigger than this at startup
+    logMaxMB: 5,               // rotate the log to .old if it's already bigger than this at startup
+    selfLogMaxMB: 2            // rotate PortDash's own log at this size (matters when running as an agent)
   }
 };
 
@@ -75,6 +81,34 @@ function expand(p) {
 
 const fmtMB = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(1) + 'G' : Math.round(mb) + 'M');
 const shorten = (p) => (p.startsWith(HOME) ? '~' + p.slice(HOME.length) : p);
+
+/** Everything PortDash says about itself goes here as well as to stdout. As a launch
+    agent stdout is discarded, so this file is the only record — and since nothing else
+    ever truncates it, it has to rotate itself. */
+function logLine(msg) {
+  console.log(msg);
+  try {
+    ensure();
+    const max = (getCfg().limits.selfLogMaxMB || 2) * 1048576;
+    if (fs.existsSync(F_SELFLOG) && fs.statSync(F_SELFLOG).size > max) {
+      fs.renameSync(F_SELFLOG, F_SELFLOG + '.old');
+    }
+    fs.appendFileSync(F_SELFLOG, `${new Date().toISOString()}  ${msg}\n`);
+  } catch (e) { /* logging must never take the process down */ }
+}
+
+/** Shared secret for the local API, so another process on this machine can't drive
+    PortDash just by knowing the port. Readable only by the owner. */
+function getToken() {
+  try {
+    const t = fs.readFileSync(F_TOKEN, 'utf8').trim();
+    if (t) return t;
+  } catch (e) { /* fall through and mint one */ }
+  ensure();
+  const t = crypto.randomBytes(32).toString('hex');
+  fs.writeFileSync(F_TOKEN, t, { mode: 0o600 });
+  return t;
+}
 
 function run(cmd, args) {
   try {
@@ -116,7 +150,7 @@ function alert_(level, text, projectId, key) {
   alertSeen[k] = now;
   alerts.unshift({ id: crypto.randomBytes(4).toString('hex'), t: now, level, text, projectId });
   alerts = alerts.slice(0, 20);
-  console.log(`[${level === 'danger' ? 'action' : 'notice'}] ${text}`);
+  logLine(`[${level === 'danger' ? 'action' : 'notice'}] ${text}`);
   if (projectId) {
     try {
       fs.appendFileSync(path.join(D_LOGS, projectId + '.log'),
@@ -226,6 +260,32 @@ function processTable() {
   return { byPid, rssByPgid };
 }
 
+/** "MM:SS", "HH:MM:SS" or "DD-HH:MM:SS" → seconds. null if it doesn't parse. */
+function etimeToSec(etime) {
+  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(String(etime || '').trim());
+  if (!m) return null;
+  const [, d, h, mm, ss] = m;
+  return (+(d || 0)) * 86400 + (+(h || 0)) * 3600 + (+mm) * 60 + (+ss);
+}
+
+/**
+ * Is the process now holding this pid still the one we started?
+ *
+ * PIDs get recycled, and a long-running agent will eventually see it happen. Our
+ * process can only be replaced by one that started *after* ours exited, so a pid
+ * whose elapsed time is meaningfully shorter than the age of our record belongs to
+ * someone else. Getting this wrong means freezing or killing an unrelated process,
+ * so anything we can't parse is treated as "not ours".
+ */
+function sameProcess(m, info) {
+  if (!m || !info) return false;
+  if (!m.startedAt) return true;              // records written before this check existed
+  const elapsed = etimeToSec(info.etime);
+  if (elapsed === null) return false;
+  const expected = (Date.now() - m.startedAt) / 1000;
+  return elapsed >= expected - 90;            // slack for clock skew and ps rounding
+}
+
 function cwdInfo(pids) {
   const map = {};
   if (!pids.length) return map;
@@ -291,6 +351,17 @@ function registrable(cwd) {
   return true;
 }
 
+/** Drop records whose process is gone, or whose pid now belongs to someone else.
+    Returns true if anything was removed. */
+function pruneManaged(byPid) {
+  let dirty = false;
+  for (const [id, m] of Object.entries(managed)) {
+    const info = byPid[m.pid];
+    if (!info || !sameProcess(m, info)) { delete managed[id]; dirty = true; }
+  }
+  return dirty;
+}
+
 // ---------------------------------------------------------------- state aggregation
 
 function buildState() {
@@ -299,11 +370,7 @@ function buildState() {
   const L = listeners();
   const { byPid, rssByPgid } = processTable();
 
-  let dirty = false;
-  for (const [id, m] of Object.entries(managed)) {
-    if (!byPid[m.pid]) { delete managed[id]; dirty = true; }
-  }
-  if (dirty) saveManaged();
+  if (pruneManaged(byPid)) saveManaged();
 
   const C = cwdInfo([...new Set(L.map((r) => r.pid))]);
   const claimed = new Set();
@@ -492,6 +559,11 @@ function watchdog() {
   const { byPid, rssByPgid } = processTable();
   const running = [];
 
+  // Nothing else prunes when running headless — buildState() only executes while a
+  // dashboard is open — so a stale pid could otherwise linger here indefinitely and
+  // eventually be matched against an unrelated process.
+  if (pruneManaged(byPid)) saveManaged();
+
   for (const [id, m] of Object.entries(managed)) {
     const info = byPid[m.pid];
     if (!info) continue;
@@ -554,18 +626,27 @@ const readBody = (req) => new Promise((resolve) => {
   req.on('end', () => { try { resolve(JSON.parse(s || '{}')); } catch (e) { resolve({}); } });
 });
 
-// Defends against a browser tab on any other page reaching this server:
+// Three layers, because the API can spawn processes:
 // - Host check blocks DNS-rebinding (attacker domain resolved to 127.0.0.1)
 // - Origin check blocks plain cross-site form/fetch requests
-// - the custom header can only be set by same-origin fetch, since a cross-origin
-//   request carrying it would need a CORS preflight this server never approves
+// - the token blocks other *local* processes, which the first two do nothing about.
+//   It lives in a custom header, so a cross-origin request carrying it would need a
+//   CORS preflight this server never approves.
 const LOCAL_HOST_RE = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
-function isTrustedRequest(req) {
+const TOKEN = getToken();
+
+function tokenOk(req, u) {
+  const sent = req.headers['x-portdash-token'] || u.searchParams.get('token') || '';
+  const a = Buffer.from(String(sent));
+  const b = Buffer.from(TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function isTrustedRequest(req, u) {
   if (!LOCAL_HOST_RE.test(req.headers.host || '')) return false;
   const origin = req.headers.origin;
   if (origin && !LOCAL_HOST_RE.test(origin.replace(/^https?:\/\//, ''))) return false;
-  if (req.headers['x-portdash'] !== '1') return false;
-  return true;
+  return tokenOk(req, u);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -573,11 +654,21 @@ const server = http.createServer(async (req, res) => {
   if (!LOCAL_HOST_RE.test(req.headers.host || '')) { res.writeHead(400); return res.end('bad host'); }
   try {
     if (u.pathname === '/') {
-      const b = Buffer.from(HTML);
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': b.length });
+      // The page is what hands the token to the browser, so it stays unauthenticated —
+      // it exposes nothing on its own, and every /api route below requires the token.
+      const b = Buffer.from(HTML.replace('__PORTDASH_TOKEN__', TOKEN));
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8', 'Content-Length': b.length,
+        'Cache-Control': 'no-store'
+      });
       return res.end(b);
     }
     if (u.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
+
+    if (u.pathname.startsWith('/api/') && !isTrustedRequest(req, u)) {
+      res.writeHead(403); return res.end('forbidden');
+    }
+
     if (u.pathname === '/api/state') return json(res, 200, buildState());
 
     if (u.pathname === '/api/logs') {
@@ -598,7 +689,6 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST') {
-      if (!isTrustedRequest(req)) { res.writeHead(403); return res.end('forbidden'); }
       const body = await readBody(req);
       if (u.pathname === '/api/scan')    return json(res, 200, scanProjects());
       if (u.pathname === '/api/start')   return json(res, 200, startProject(body.id));
@@ -745,8 +835,11 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 </dialog>
 
 <script>
+const TOKEN='__PORTDASH_TOKEN__';
 const STATE={byId:{}};
 let editingId=null, logId=null;
+
+const authed=(p)=>fetch(p,{headers:{'X-Portdash-Token':TOKEN}});
 
 function toast(m){
   document.querySelectorAll('.err').forEach(e=>e.remove());
@@ -754,7 +847,7 @@ function toast(m){
   document.body.appendChild(d); setTimeout(()=>d.remove(),5000);
 }
 async function api(p,b){
-  const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json','X-Portdash':'1'},body:JSON.stringify(b||{})});
+  const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json','X-Portdash-Token':TOKEN},body:JSON.stringify(b||{})});
   const j=await r.json().catch(()=>({}));
   if(!r.ok){ toast(j.error||'Action failed'); throw new Error(j.error); }
   return j;
@@ -778,7 +871,7 @@ async function saveEdit(){
 }
 async function showLogs(p){
   logId=p.id; l_title.textContent='Logs · '+p.name; l_body.textContent='Loading…'; logs.showModal();
-  l_body.textContent=await (await fetch('/api/logs?id='+encodeURIComponent(p.id))).text();
+  l_body.textContent=await (await authed('/api/logs?id='+encodeURIComponent(p.id))).text();
   l_body.scrollTop=l_body.scrollHeight;
 }
 async function remove(p){
@@ -845,7 +938,7 @@ document.addEventListener('click', async (e)=>{
 });
 
 async function load(){
-  let s; try{ s=await (await fetch('/api/state')).json(); }catch(e){ return; }
+  let s; try{ s=await (await authed('/api/state')).json(); }catch(e){ return; }
   STATE.byId={}; s.projects.forEach(p=>STATE.byId[p.id]=p);
 
   const run=s.projects.filter(p=>p.status==='running').length;
@@ -869,36 +962,135 @@ async function load(){
     : '<div class="empty">No projects registered yet. Click "Rescan" above, or edit scanRoots in ~/.portdash/config.json.</div>';
   others.innerHTML = s.others.length ? s.others.map(otherRow).join('')
     : '<div class="empty">No other processes are listening on a port.</div>';
-  if(logs.open&&logId) l_body.textContent=await (await fetch('/api/logs?id='+encodeURIComponent(logId))).text();
+  if(logs.open&&logId) l_body.textContent=await (await authed('/api/logs?id='+encodeURIComponent(logId))).text();
 }
 load(); setInterval(load,2500);
 </script></body></html>`;
 
+// ---------------------------------------------------------------- launch agent
+
+const PLIST = (nodeBin, script, logFile) => `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${nodeBin}</string>
+    <string>${script}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>${logFile}</string>
+  <key>StandardErrorPath</key><string>${logFile}</string>
+</dict>
+</plist>
+`;
+
+function launchctl(args) {
+  try {
+    execFileSync('launchctl', args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 });
+    return true;
+  } catch (e) { return false; }
+}
+
+function installAgent() {
+  if (!IS_MAC) {
+    console.error('--install-agent is macOS-only (it writes a LaunchAgent).');
+    console.error('On Linux, write a systemd --user unit that runs: ' + process.execPath + ' ' + __filename);
+    process.exit(1);
+  }
+  // An npx copy lives in a cache npm is free to clear, which would leave the agent
+  // pointing at a path that no longer exists.
+  if (/[\\/]_npx[\\/]/.test(__filename)) {
+    console.error('Refusing to install: this copy is running from the npx cache, which npm may delete.');
+    console.error('Install it properly first:  npm install -g @bluemanta/portdash');
+    process.exit(1);
+  }
+  ensure();
+  fs.mkdirSync(path.dirname(F_PLIST), { recursive: true });
+  // launchd keeps its redirect fd open across our own rotation, so point it at a
+  // separate file from the one logLine() manages.
+  const agentLog = path.join(ROOT, 'agent.out.log');
+  fs.writeFileSync(F_PLIST, PLIST(process.execPath, __filename, agentLog));
+
+  launchctl(['bootout', `gui/${process.getuid()}/${AGENT_LABEL}`]);   // ignore failure: may not be loaded
+  const ok = launchctl(['bootstrap', `gui/${process.getuid()}`, F_PLIST]) ||
+             launchctl(['load', '-w', F_PLIST]);
+  if (!ok) {
+    console.error(`Wrote ${F_PLIST}, but launchctl wouldn't load it. Load it manually with:`);
+    console.error(`  launchctl bootstrap gui/$(id -u) ${F_PLIST}`);
+    process.exit(1);
+  }
+  console.log(`Installed. PortDash now starts at login and keeps the memory watchdog running.`);
+  console.log(`  plist:  ${F_PLIST}`);
+  console.log(`  log:    ${F_SELFLOG}`);
+  console.log(`  remove: portdash --uninstall-agent`);
+}
+
+function uninstallAgent() {
+  if (!IS_MAC) { console.error('--uninstall-agent is macOS-only.'); process.exit(1); }
+  launchctl(['bootout', `gui/${process.getuid()}/${AGENT_LABEL}`]) || launchctl(['unload', '-w', F_PLIST]);
+  if (fs.existsSync(F_PLIST)) fs.unlinkSync(F_PLIST);
+  console.log('Uninstalled. Services already running are unaffected.');
+}
+
 // ---------------------------------------------------------------- boot
+
+const argv = process.argv.slice(2);
+if (argv.includes('--help') || argv.includes('-h')) {
+  console.log(`PortDash — a visual control panel for local dev servers
+
+  portdash                    start the dashboard and watchdog
+  portdash --install-agent    run at login as a background LaunchAgent (macOS)
+  portdash --uninstall-agent  remove the LaunchAgent
+  portdash --version          print the version
+
+Config, logs and the API token live in ~/.portdash/`);
+  process.exit(0);
+}
+if (argv.includes('--version') || argv.includes('-v')) {
+  console.log(readJSON(path.join(__dirname, 'package.json'), { version: 'unknown' }).version);
+  process.exit(0);
+}
+if (argv.includes('--install-agent')) { installAgent(); process.exit(0); }
+if (argv.includes('--uninstall-agent')) { uninstallAgent(); process.exit(0); }
 
 ensure();
 if (!fs.existsSync(F_CFG)) writeJSON(F_CFG, DEFAULT_CFG);
-if (!fs.existsSync(F_REG)) console.log(`First run: found ${scanProjects().added} project(s)`);
+if (!fs.existsSync(F_REG)) logLine(`First run: found ${scanProjects().added} project(s)`);
 
 const cfg0 = getCfg();
-setInterval(watchdog, 2000);   // every 2s — any slower and a runaway process could eat several more GB in between checks
+let watchdogTimer = null;
+let bindTries = 0;
 
 server.listen(cfg0.uiPort, '127.0.0.1', () => {
+  bindTries = 0;
+  // Only once we own the port, so a second copy waiting to bind never runs a
+  // competing watchdog against the same processes.
+  if (!watchdogTimer) watchdogTimer = setInterval(watchdog, 2000);
+
   const sm = sysMem();
-  console.log(`\n  PortDash → http://localhost:${cfg0.uiPort}\n`);
-  console.log(`  Memory protection: ${cfg0.limits.enabled ? 'on' : 'off'}` +
+  logLine(`PortDash → http://localhost:${cfg0.uiPort}`);
+  logLine(`  Memory protection: ${cfg0.limits.enabled ? 'on' : 'off'}` +
     (cfg0.limits.enabled
       ? ` (freeze at ${cfg0.limits.projectRssMB}M / kill at ${cfg0.limits.hardRssMB}M per project, node heap ${cfg0.limits.nodeHeapMB}M)`
       : ''));
-  if (sm) console.log(`  System: ${sm.availPct}% available of ${(sm.totalMB / 1024).toFixed(0)}G, swap used ${sm.swapUsedMB}M`);
-  console.log(`  Config: ${F_CFG}`);
+  if (sm) logLine(`  System: ${sm.availPct}% available of ${(sm.totalMB / 1024).toFixed(0)}G, swap used ${sm.swapUsedMB}M`);
+  logLine(`  Config: ${F_CFG}`);
   console.log(`  Ctrl+C to quit (won't affect services already started)\n`);
 });
 
 server.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') {
-    console.error(`Port ${cfg0.uiPort} is already in use. Change uiPort in ${F_CFG}.`);
-    process.exit(1);
+  if (e.code !== 'EADDRINUSE') throw e;
+  // Exiting here would make launchd restart us immediately and spin. Wait instead:
+  // usually it's another PortDash, and if that one goes away we take over.
+  bindTries++;
+  const wait = Math.min(60, 5 * Math.min(bindTries, 12));
+  if (bindTries === 1) {
+    logLine(`Port ${cfg0.uiPort} is in use — retrying every ${wait}s. Change uiPort in ${F_CFG} to use another.`);
   }
-  throw e;
+  setTimeout(() => server.listen(cfg0.uiPort, '127.0.0.1'), wait * 1000);
 });
