@@ -1,6 +1,6 @@
 {
   "name": "@bluemanta/portdash",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A visual control panel for local dev servers — see every listening port, control it, and freeze (not kill) runaway memory before it takes the machine down.",
   "keywords": [
     "dev-server",
