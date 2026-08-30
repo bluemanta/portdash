@@ -68,9 +68,20 @@ function readJSON(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return fallback; }
 }
 
+/** Write through a temp file and rename, which is atomic on the same filesystem.
+    writeFileSync truncates first, so being interrupted mid-write would leave a partial
+    file — and readJSON falls back to a default on parse errors, meaning a crash at the
+    wrong moment would silently discard the whole project registry. */
 function writeJSON(file, data) {
   ensure();
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) { /* nothing useful to do */ }
+    throw e;
+  }
 }
 
 function expand(p) {
@@ -439,6 +450,10 @@ function buildState() {
 // ---------------------------------------------------------------- process control
 
 function signalGroup(pgid, sig) {
+  // kill(-0) and kill(0) both mean "everyone in *our* process group" — that would
+  // signal PortDash itself and whatever shell launched it. Nothing below pid 2 is
+  // ever a legitimate target either.
+  if (!Number.isInteger(pgid) || pgid < 2) return false;
   try { process.kill(-pgid, sig); return true; } catch (e) { /* fall through */ }
   try { process.kill(pgid, sig); return true; } catch (e) { return false; }
 }
@@ -503,6 +518,7 @@ function startProject(id) {
     env
   });
   child.unref();
+  fs.closeSync(fd);                  // the child holds its own dup; keeping ours leaks one fd per start
 
   starting.add(id);
   setTimeout(() => starting.delete(id), 3000);
@@ -513,9 +529,11 @@ function startProject(id) {
 }
 
 function resolveTarget(body) {
-  if (body.pid) {
-    const t = processTable().byPid[body.pid];
-    return { pid: +body.pid, pgid: t ? t.pgid : +body.pid };
+  if (body.pid !== undefined && body.pid !== null && body.pid !== '') {
+    const pid = Number(body.pid);
+    if (!Number.isInteger(pid) || pid < 2) throw new Error(`Not a valid pid: ${body.pid}`);
+    const t = processTable().byPid[pid];
+    return { pid, pgid: t ? t.pgid : pid };
   }
   const st = buildState().projects.find((p) => p.id === body.id);
   if (!st || !st.pid) throw new Error('This project is not currently running');
