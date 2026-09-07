@@ -78,6 +78,7 @@ Two things to weigh before doing that:
 - **See** every process listening on a port, grouped by project, with live memory usage per group
 - **Control** start / pause / resume / restart / stop — signals go to the whole process group, so everything `npm run dev` spawns gets caught too
 - **Pause means pause**: SIGSTOP freezes the process in place. Memory and ports stay held. Resuming (SIGCONT) is instant
+- **Pin** the handful you open every day with the ☆ button — they sit in their own section at the top, in the same place whether they're running or not, with a clickable address either way
 - **Logs**: anything PortDash starts gets its output recorded under `~/.portdash/logs/`, viewable right in the UI
 - **Recognizes servers you started yourself** — if you ran a dev server by hand in a terminal, PortDash matches it to the right project by working directory and lets you control it too
 

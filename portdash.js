@@ -32,6 +32,11 @@ const D_LOGS = path.join(ROOT, 'logs');
 const SHELL = process.env.SHELL || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash');
 const IS_MAC = process.platform === 'darwin';
 
+// If PortDash's own directory is registered as a project, that row is PortDash itself.
+// Matching it by working directory the way external servers are matched doesn't work:
+// under launchd our cwd is "/", not wherever the script lives.
+const SELF_DIR = path.dirname(__filename);
+
 const AGENT_LABEL = 'com.bluemanta.portdash';
 const F_PLIST = path.join(HOME, 'Library', 'LaunchAgents', AGENT_LABEL + '.plist');
 
@@ -227,7 +232,7 @@ function scanProjects() {
   for (const f of found) {
     if (known.has(f.cwd)) continue;        // never overwrite an already-registered project (keeps your edits)
     reg.push({ id: idOf(f.cwd), name: f.name, cwd: f.cwd, cmd: f.cmd, kind: f.kind,
-               port: null, memMB: null, heapMB: null });
+               port: null, memMB: null, heapMB: null, pinned: false });
     added++;
   }
   setReg(reg);
@@ -389,8 +394,9 @@ function buildState() {
 
   const projects = reg.map((p) => {
     let pid = null, source = null;
+    if (p.cwd === SELF_DIR) { pid = process.pid; source = 'self'; }
     const m = managed[p.id];
-    if (m && byPid[m.pid]) { pid = m.pid; source = 'managed'; }
+    if (!pid && m && byPid[m.pid]) { pid = m.pid; source = 'managed'; }
     if (!pid) {
       const hit = L.find((r) => C[r.pid] === p.cwd);
       if (hit) { pid = hit.pid; source = 'external'; }
@@ -410,6 +416,7 @@ function buildState() {
 
     return Object.assign({}, p, {
       cwdShort: shorten(p.cwd), status, pid, pgid, ports, etime, source, rssMB,
+      pinned: !!p.pinned,
       memLimit: p.memMB || cfg.limits.projectRssMB,
       openPort: ports[0] || p.port || null
     });
@@ -458,6 +465,17 @@ function signalGroup(pgid, sig) {
   try { process.kill(pgid, sig); return true; } catch (e) { return false; }
 }
 
+const isSelfProject = (id) => { const p = getReg().find((x) => x.id === id); return !!(p && p.cwd === SELF_DIR); };
+
+/** PortDash can't be driven from its own dashboard. Stopping it hands control to whatever
+    supervises it (launchd restarts it, a shell doesn't), and SIGSTOP would freeze the only
+    process able to deliver the SIGCONT — the dashboard would be gone with no way back. */
+function refuseSelf(st) {
+  if (st && st.source === 'self') {
+    throw new Error('That row is PortDash itself — start and stop it wherever it was launched from (launchctl, or the terminal you ran it in), not from here.');
+  }
+}
+
 const starting = new Set();          // projects currently starting up, guards against double-clicks
 const startLog = {};                 // id → recent start timestamps, guards against crash-restart loops
 
@@ -473,6 +491,7 @@ function startProject(id) {
   const lim = getCfg().limits;
   const p = getReg().find((x) => x.id === id);
   if (!p) throw new Error('Project not found');
+  refuseSelf({ source: p.cwd === SELF_DIR ? 'self' : null });
   if (!p.cmd) throw new Error('No start command configured for this project — click "Edit" and set one (e.g. npm run dev)');
   if (!fs.existsSync(p.cwd)) throw new Error('Directory does not exist: ' + p.cwd);
 
@@ -532,10 +551,12 @@ function resolveTarget(body) {
   if (body.pid !== undefined && body.pid !== null && body.pid !== '') {
     const pid = Number(body.pid);
     if (!Number.isInteger(pid) || pid < 2) throw new Error(`Not a valid pid: ${body.pid}`);
+    refuseSelf({ source: pid === process.pid ? 'self' : null });
     const t = processTable().byPid[pid];
     return { pid, pgid: t ? t.pgid : pid };
   }
   const st = buildState().projects.find((p) => p.id === body.id);
+  refuseSelf(st);
   if (!st || !st.pid) throw new Error('This project is not currently running');
   return { pid: st.pid, pgid: st.pgid };
 }
@@ -557,6 +578,7 @@ const waitGone = (pid, ms) => new Promise((resolve) => {
 
 async function restartProject(id) {
   const st = buildState().projects.find((p) => p.id === id);
+  refuseSelf(st);
   if (st && st.pid) {
     signalGroup(st.pgid, 'SIGCONT');
     signalGroup(st.pgid, 'SIGTERM');
@@ -703,7 +725,10 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/state') return json(res, 200, buildState());
 
     if (u.pathname === '/api/logs') {
-      const f = path.join(D_LOGS, path.basename(String(u.searchParams.get('id'))) + '.log');
+      const id = String(u.searchParams.get('id'));
+      // PortDash doesn't start itself, so it has no file in logs/ — its own log is the
+      // one that actually answers "why did the dashboard restart".
+      const f = isSelfProject(id) ? F_SELFLOG : path.join(D_LOGS, path.basename(id) + '.log');
       let text = '(No logs yet. Logs are only recorded for services started through PortDash.)';
       if (fs.existsSync(f)) {
         const size = fs.statSync(f).size, cap = 200 * 1024;
@@ -741,6 +766,21 @@ const server = http.createServer(async (req, res) => {
         setReg(reg);
         return json(res, 200, { ok: true });
       }
+      if (u.pathname === '/api/pin') {
+        const reg = getReg();
+        const p = reg.find((x) => x.id === body.id);
+        if (!p) throw new Error('Project not found');
+        p.pinned = !!body.pinned;
+        // A pinned row is there to be a clickable address, so it needs a port even when
+        // the project is stopped. If none was ever configured, borrow the one it is
+        // listening on right now — that is the address the user just pinned.
+        if (p.pinned && !p.port) {
+          const st = buildState().projects.find((x) => x.id === body.id);
+          if (st && st.ports.length) p.port = st.ports[0];
+        }
+        setReg(reg);
+        return json(res, 200, { ok: true, pinned: p.pinned });
+      }
       if (u.pathname === '/api/register') {
         if (!body.cwd) throw new Error("Couldn't determine this process's working directory, can't register it");
         if (!registrable(body.cwd)) throw new Error(`${body.cwd} doesn't look like a project directory — it's a system or sandboxed-app path`);
@@ -748,7 +788,7 @@ const server = http.createServer(async (req, res) => {
         if (reg.some((x) => x.cwd === body.cwd)) throw new Error('This directory is already registered');
         const d = detectProject(body.cwd) || { name: path.basename(body.cwd), cmd: '', kind: 'unknown' };
         reg.push({ id: idOf(body.cwd), name: d.name, cwd: body.cwd, cmd: d.cmd, kind: d.kind,
-                   port: body.port || null, memMB: null, heapMB: null });
+                   port: body.port || null, memMB: null, heapMB: null, pinned: false });
         setReg(reg);
         return json(res, 200, { ok: true });
       }
@@ -792,6 +832,9 @@ h2{font-size:13px;color:var(--dim);font-weight:600;margin:26px 0 10px;letter-spa
 .row{background:var(--card);border:1px solid var(--line);border-radius:10px;
   padding:13px 15px;margin-bottom:8px;display:flex;align-items:center;gap:13px}
 .row.hot{border-color:color-mix(in srgb,var(--pause) 55%,var(--line))}
+button.star{padding:5px 8px;line-height:1}
+button.star.on{color:var(--pause);border-color:color-mix(in srgb,var(--pause) 45%,var(--line))}
+button.star.on:hover{color:var(--pause)}
 .dot{width:8px;height:8px;border-radius:50%;flex:none}
 .dot.running{background:var(--run);box-shadow:0 0 0 3px color-mix(in srgb,var(--run) 22%,transparent)}
 .dot.paused{background:var(--pause);box-shadow:0 0 0 3px color-mix(in srgb,var(--pause) 22%,transparent)}
@@ -802,6 +845,7 @@ h2{font-size:13px;color:var(--dim);font-weight:600;margin:26px 0 10px;letter-spa
   white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .tag{font-size:11px;padding:1px 7px;border-radius:20px;border:1px solid var(--line);color:var(--dim);font-weight:400}
 .tag.port{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 35%,var(--line));font-family:ui-monospace,Menlo,monospace}
+.tag.port.idle{color:var(--dim);border-color:var(--line)}
 .tag.mem{font-family:ui-monospace,Menlo,monospace}
 .tag.mem.warn{color:var(--pause);border-color:color-mix(in srgb,var(--pause) 45%,var(--line))}
 .tag.mem.bad{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,var(--line))}
@@ -835,6 +879,10 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     <button onclick="scan()">Rescan</button>
   </header>
   <div id="alerts"></div>
+  <div id="pinwrap" hidden>
+    <h2>Pinned</h2>
+    <div id="pins"></div>
+  </div>
   <h2>My projects</h2>
   <div id="projects"></div>
   <h2>Other processes on listening ports</h2>
@@ -922,18 +970,32 @@ function memTag(rss,limit){
     +' <span class="bar"><i class="'+cls+'" style="width:'+w+'%"></i></span></span>';
 }
 
+function pinBtn(p){
+  return '<button class="star'+(p.pinned?' on':'')+'" data-act="pin" data-id="'+p.id+'"'
+    +' data-pinned="'+(p.pinned?1:0)+'" title="'+(p.pinned?'Unpin':'Pin to the top')+'">'
+    +(p.pinned?'★':'☆')+'</button>';
+}
+
 function projectRow(p){
   const label={running:'running',paused:'frozen',stopped:'stopped'}[p.status];
-  const ports=p.ports.map(x=>'<span class="tag port">:'+x+'</span>').join('');
+  // A stopped project has no live port, but its configured one is still the address
+  // you go to — show it dimmed so a pinned row is useful before you press Start.
+  const ports=p.ports.length
+    ? p.ports.map(x=>'<span class="tag port">:'+x+'</span>').join('')
+    : (p.port?'<span class="tag port idle">:'+p.port+'</span>':'');
+  const openBtn=p.openPort?'<button data-act="open" data-port="'+p.openPort+'">Open</button>':'';
   let acts='';
-  if(p.status==='stopped') acts=btn('start',p.id,'Start','p');
+  // The self row gets no lifecycle buttons: whatever supervises PortDash owns them.
+  if(p.source==='self') acts=openBtn;
+  else if(p.status==='stopped') acts=openBtn+btn('start',p.id,'Start','p');
   else if(p.status==='running')
-    acts=(p.openPort?'<button data-act="open" data-port="'+p.openPort+'">Open</button>':'')
-        +btn('pause',p.id,'Pause')+btn('restart',p.id,'Restart')+btn('stop',p.id,'Stop','d');
+    acts=openBtn+btn('pause',p.id,'Pause')+btn('restart',p.id,'Restart')+btn('stop',p.id,'Stop','d');
   else acts=btn('resume',p.id,'Resume','p')+btn('stop',p.id,'Stop','d');
-  acts+=btn('logs',p.id,'Logs')+btn('edit',p.id,'Edit')+btn('remove',p.id,'×','d');
-  const badge=p.source==='external'?'<span class="tag">external</span>':'';
-  const cmdTxt=p.cmd?esc(p.cmd):'<span style="color:var(--pause)">no start command configured</span>';
+  acts+=pinBtn(p)+btn('logs',p.id,'Logs')+btn('edit',p.id,'Edit')+btn('remove',p.id,'×','d');
+  const badge=p.source==='self'?'<span class="tag">self</span>'
+             :p.source==='external'?'<span class="tag">external</span>':'';
+  const cmdTxt=p.source==='self'?'serving this dashboard'
+             :p.cmd?esc(p.cmd):'<span style="color:var(--pause)">no start command configured</span>';
   const hot=(p.rssMB&&p.memLimit&&p.rssMB/p.memLimit>=.6)?' hot':'';
   return '<div class="row'+hot+'"><span class="dot '+p.status+'"></span><div class="main">'
     +'<div class="nm">'+esc(p.name)+ports+memTag(p.rssMB,p.memLimit)+badge+'</div>'
@@ -964,6 +1026,7 @@ document.addEventListener('click', async (e)=>{
   if(a==='remove')   return remove(STATE.byId[id]);
   if(a==='dismiss')  return act('/api/dismiss',{alertId:b.dataset.alert});
   if(a==='register') return act('/api/register',{cwd:b.dataset.cwd,port:+b.dataset.port});
+  if(a==='pin')      return act('/api/pin',{id:id,pinned:b.dataset.pinned!=='1'});
   const M={start:'/api/start',stop:'/api/stop',pause:'/api/pause',resume:'/api/resume',restart:'/api/restart'};
   if(M[a]) return act(M[a], id?{id:id}:{pid:pid});
 });
@@ -986,11 +1049,20 @@ async function load(){
   alerts.innerHTML=(s.alerts||[]).map(a=>'<div class="alert '+a.level+'"><div>'+esc(a.text)+'</div>'
     +'<button class="x" data-act="dismiss" data-alert="'+a.id+'">×</button></div>').join('');
 
+  // Pinned rows keep the same place whatever they are doing — sorting them by status
+  // would move them around as things start and stop, which defeats the point.
+  const pinned=s.projects.filter(p=>p.pinned).sort((a,b)=>a.name.localeCompare(b.name));
+  const rest=s.projects.filter(p=>!p.pinned);
+  pinwrap.hidden=!pinned.length;
+  pins.innerHTML=pinned.map(projectRow).join('');
+
   const ord={running:0,paused:1,stopped:2};
-  projects.innerHTML = s.projects.length
-    ? s.projects.slice().sort((a,b)=>ord[a.status]-ord[b.status]||a.name.localeCompare(b.name))
+  projects.innerHTML = rest.length
+    ? rest.slice().sort((a,b)=>ord[a.status]-ord[b.status]||a.name.localeCompare(b.name))
         .map(projectRow).join('')
-    : '<div class="empty">No projects registered yet. Click "Rescan" above, or edit scanRoots in ~/.portdash/config.json.</div>';
+    : (pinned.length
+        ? '<div class="empty">Everything else is pinned above.</div>'
+        : '<div class="empty">No projects registered yet. Click "Rescan" above, or edit scanRoots in ~/.portdash/config.json.</div>');
   others.innerHTML = s.others.length ? s.others.map(otherRow).join('')
     : '<div class="empty">No other processes are listening on a port.</div>';
   if(logs.open&&logId) l_body.textContent=await (await authed('/api/logs?id='+encodeURIComponent(logId))).text();
