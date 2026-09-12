@@ -14,6 +14,7 @@
  */
 
 const http = require('http');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -46,6 +47,11 @@ const DEFAULT_CFG = {
   scanDepth: 3,
   ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'out', '.next', '.nuxt',
                'vendor', '.venv', 'venv', '__pycache__', 'target', '.cache', 'coverage'],
+
+  // How long a service may take to open its port and answer before the row stops saying
+  // "starting" and starts saying it isn't answering. Raise it if a cold first build on
+  // this machine legitimately takes longer than this.
+  readyGraceSec: 60,
 
   // ------- Memory protection. Raise the numbers to loosen it, or set enabled:false to turn it off -------
   limits: {
@@ -913,6 +919,124 @@ function ownerOf(pid, byPid, jobs) {
   return { kind: 'detached' };
 }
 
+// ---------------------------------------------------------------- health
+//
+// "Running" has meant "there is a process" since the first version, which is not the
+// question anyone is actually asking. A dev server spends its first twenty seconds
+// compiling and is not usable yet; a wedged one — event loop blocked, waiting on a pool
+// that will never open — is not usable any more. To ps both look exactly like a healthy
+// one, so both get a green dot, and clicking Open on either gets a browser error with
+// no explanation on the page whose whole job is explaining.
+//
+// So ask the port instead of the process table. A TCP connect says whether anything is
+// accepting; one HTTP request says whether it is serving.
+//
+// Any HTTP response counts as serving, 404 and 500 included. A 404 on / means the
+// server is up and routing — plenty of dev servers have nothing at the root — and
+// requiring a 200 would report most of them as broken.
+//
+// Nothing is asked for HTTP twice once it turns out not to speak it. A database
+// registered as a project would otherwise collect a protocol error in its log every few
+// seconds for as long as PortDash runs. That conclusion is only drawn from a definitive
+// answer — bytes that aren't HTTP, or an accepted connection closed without a word. A
+// timeout means "not yet", which is a different thing, and remembering it as "never"
+// would permanently downgrade a service that was merely busy the first time we asked.
+
+const PROBE_EVERY_MS = 2000;      // how often a project someone is looking at is re-checked
+const PROBE_TIMEOUT_MS = 2000;    // silence for this long is not an answer
+const PROBE_INTEREST_MS = 15000;  // how long a port stays worth checking after the last render
+
+const health = {};                // port -> { open, answered, via, ms, at }
+const speaksHttp = {};            // port -> true | false, absent while unknown
+const probeWanted = new Map();    // port -> the moment it stops being interesting
+const probing = new Set();
+
+/** Ask one port what it is. Resolves to a fact, never throws: deciding what the fact
+    means for a row is the caller's job, because that needs the age of the process. */
+function probe(port) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const sock = new net.Socket();
+    let done = false, head = '';
+    const finish = (open, answered, via) => {
+      if (done) return;
+      done = true;
+      sock.destroy();
+      health[port] = { open, answered, via, ms: Date.now() - t0, at: Date.now() };
+      resolve(health[port]);
+    };
+
+    sock.setTimeout(PROBE_TIMEOUT_MS);
+    sock.on('error', () => finish(false, false, null));          // refused, or gone
+    sock.on('timeout', () => finish(true, false, null));         // connected, said nothing
+    sock.on('connect', () => {
+      if (speaksHttp[port] === false) return finish(true, true, 'tcp');
+      sock.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n`
+               + 'User-Agent: PortDash-healthcheck\r\nAccept: */*\r\nConnection: close\r\n\r\n');
+    });
+    sock.on('data', (b) => {
+      head += b.toString('latin1', 0, 32);
+      if (/^HTTP\//.test(head)) { speaksHttp[port] = true; return finish(true, true, 'http'); }
+      speaksHttp[port] = false;                                  // definitely something else
+      finish(true, true, 'tcp');
+    });
+    sock.on('close', () => {
+      // Accepted the connection and hung up without answering. Something is listening,
+      // it just doesn't want to talk to us in HTTP.
+      if (!done) { speaksHttp[port] = false; finish(true, true, 'tcp'); }
+    });
+
+    sock.connect(port, '127.0.0.1');
+  });
+}
+
+/** Rendering says which ports are worth asking about. Nothing probes on its own, so a
+    PortDash with no dashboard open does exactly what it did before. */
+const wantProbe = (port) => probeWanted.set(port, Date.now() + PROBE_INTEREST_MS);
+
+function probeTick() {
+  const now = Date.now();
+  for (const [port, until] of probeWanted) {
+    if (until < now) { probeWanted.delete(port); continue; }
+    if (probing.has(port)) continue;
+    const last = health[port];
+    if (last && now - last.at < PROBE_EVERY_MS) continue;
+    probing.add(port);
+    probe(port).then(() => probing.delete(port), () => probing.delete(port));
+  }
+}
+
+/**
+ * What a row should say about itself. Only running projects have a health question:
+ * a stopped one has nothing to ask, and a frozen one is frozen by our own hand and
+ * would report as unreachable, which would read as a fault rather than a state.
+ *
+ * A project with no port open is not probed at all. Probing its *configured* port
+ * instead would find whatever else happens to be there and call this project ready.
+ */
+function healthFor(status, ports, etime, graceSec) {
+  if (status !== 'running') return null;
+  const ageMs = (etimeToSec(etime) || 0) * 1000;
+  const young = ageMs < graceSec * 1000;
+
+  if (!ports.length) {
+    return young
+      ? { state: 'starting', why: 'no port open yet' }
+      : { state: 'unreachable', why: 'running, but not listening on any port' };
+  }
+
+  const port = ports[0];
+  wantProbe(port);
+  const r = health[port];
+  if (!r) return { state: 'checking', port };
+  if (!r.open || !r.answered) {
+    return young
+      ? { state: 'starting', port, why: `:${port} is open but hasn't answered yet` }
+      : { state: 'unreachable', port, why: `no answer from :${port}` };
+  }
+  return { state: 'ready', port, via: r.via, ms: r.ms };
+}
+
 // ---------------------------------------------------------------- sampling
 //
 // Everything the dashboard shows came from shelling out, synchronously, inside the
@@ -1004,6 +1128,7 @@ function buildState(fresh) {
 
     return Object.assign({}, p, {
       cwdShort: shorten(p.cwd), status, pid, pgid, ports, etime, source, rssMB, owner,
+      health: healthFor(status, ports, etime, cfg.readyGraceSec),
       pinned: !!p.pinned,
       memLimit: p.memMB || cfg.limits.projectRssMB,
       openPort: ports[0] || p.port || null
@@ -1530,6 +1655,11 @@ button.star.on:hover{color:var(--pause)}
 .dot.running{background:var(--run);box-shadow:0 0 0 3px color-mix(in srgb,var(--run) 22%,transparent)}
 .dot.paused{background:var(--pause);box-shadow:0 0 0 3px color-mix(in srgb,var(--pause) 22%,transparent)}
 .dot.stopped{background:var(--stop)}
+.dot.starting{background:var(--pause);box-shadow:0 0 0 3px color-mix(in srgb,var(--pause) 22%,transparent);
+  animation:pd-pulse 1.1s ease-in-out infinite}
+.dot.unreachable{background:var(--danger);box-shadow:0 0 0 3px color-mix(in srgb,var(--danger) 22%,transparent)}
+@keyframes pd-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@media (prefers-reduced-motion:reduce){.dot.starting{animation:none}}
 .main{flex:1;min-width:0}
 .nm{font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .meta{color:var(--dim);font-size:12px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;
@@ -1540,7 +1670,8 @@ button.star.on:hover{color:var(--pause)}
 .tag.mem{font-family:ui-monospace,Menlo,monospace}
 .tag.mem.warn{color:var(--pause);border-color:color-mix(in srgb,var(--pause) 45%,var(--line))}
 .tag.mem.bad{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,var(--line))}
-.tag.sup{color:var(--pause);border-color:color-mix(in srgb,var(--pause) 45%,var(--line))}
+.tag.warn{color:var(--pause);border-color:color-mix(in srgb,var(--pause) 45%,var(--line))}
+.tag.bad{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,var(--line))}
 .acts{display:flex;gap:6px;flex:none;flex-wrap:wrap;justify-content:flex-end}
 .empty{color:var(--dim);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}
 .alert{border-radius:10px;padding:11px 14px;margin-bottom:8px;display:flex;gap:10px;
@@ -1752,7 +1883,7 @@ function memTag(rss,limit){
 function ownerTag(o){
   if(!o||o.kind==='portdash') return '';
   if(o.kind==='self')    return '<span class="tag">self</span>';
-  if(o.kind==='launchd') return '<span class="tag sup">launchd · '+esc(o.label)+'</span>';
+  if(o.kind==='launchd') return '<span class="tag warn">launchd · '+esc(o.label)+'</span>';
   if(o.kind==='app')     return '<span class="tag">'+esc(o.label)+'</span>';
   if(o.kind==='from')    return '<span class="tag">from '+esc(o.label)+'</span>';
   return '<span class="tag">detached</span>';
@@ -1774,8 +1905,27 @@ function pinBtn(p){
     +(p.pinned?'★':'☆')+'</button>';
 }
 
+// "running" answers whether a process exists. What you want to know is whether the
+// thing is usable, and those are different questions with different answers — so the
+// dot and the word come from the health check, and only fall back to the process when
+// there is nothing to check or nothing has been checked yet.
+const HEALTH_WORD={ready:'ready',starting:'starting',unreachable:'not answering'};
+function dotClass(p){
+  if(p.status!=='running') return p.status;
+  const s=p.health&&p.health.state;
+  return s==='starting'||s==='unreachable'?s:'running';
+}
+function healthTag(p){
+  const h=p.health;
+  if(!h||h.state==='ready'||h.state==='checking') return '';
+  const cls=h.state==='unreachable'?'bad':'warn';
+  return '<span class="tag '+cls+'" title="'+esc(h.why||'')+'">'+HEALTH_WORD[h.state]+'</span>';
+}
+
 function projectRow(p){
-  const label={running:'running',paused:'frozen',stopped:'stopped'}[p.status];
+  const label=p.status==='running'
+    ? ((p.health&&HEALTH_WORD[p.health.state])||'running')
+    : {paused:'frozen',stopped:'stopped'}[p.status];
   // A stopped project has no live port, but its configured one is still the address
   // you go to — show it dimmed so a pinned row is useful before you press Start.
   const ports=p.ports.length
@@ -1798,8 +1948,8 @@ function projectRow(p){
   const cmdTxt=p.source==='self'?'serving this dashboard'
              :p.cmd?esc(p.cmd):'<span style="color:var(--pause)">no start command configured</span>';
   const hot=(p.rssMB&&p.memLimit&&p.rssMB/p.memLimit>=.6)?' hot':'';
-  return '<div class="row'+hot+'"><span class="dot '+p.status+'"></span><div class="main">'
-    +'<div class="nm">'+esc(p.name)+ports+memTag(p.rssMB,p.memLimit)+badge+'</div>'
+  return '<div class="row'+hot+'"><span class="dot '+dotClass(p)+'"></span><div class="main">'
+    +'<div class="nm">'+esc(p.name)+ports+healthTag(p)+memTag(p.rssMB,p.memLimit)+badge+'</div>'
     +'<div class="meta">'+esc(p.cwdShort)+'  ·  '+cmdTxt
     +(p.etime?'  ·  '+label+' '+esc(p.etime):'')+'</div></div>'
     +'<div class="acts">'+acts+'</div></div>';
@@ -2019,6 +2169,7 @@ Config, logs and the API token live in ~/.portdash/`);
 
   const cfg0 = getCfg();
   let watchdogTimer = null;
+  let probeTimer = null;
   let bindTries = 0;
 
   server.listen(cfg0.uiPort, '127.0.0.1', () => {
@@ -2026,6 +2177,9 @@ Config, logs and the API token live in ~/.portdash/`);
     // Only once we own the port, so a second copy waiting to bind never runs a
     // competing watchdog against the same processes.
     if (!watchdogTimer) watchdogTimer = setInterval(watchdog, 2000);
+    // Health probes only ever check ports a render asked about, so this costs nothing
+    // until someone opens the dashboard, and stops again shortly after they close it.
+    if (!probeTimer) probeTimer = setInterval(probeTick, 1000);
 
     const sm = sysMem();
     logLine(`PortDash → http://localhost:${cfg0.uiPort}`);
@@ -2073,9 +2227,10 @@ module.exports = {
   etimeToSec, sameProcess, processTable, listeners, sysMem,
   whichIn, envSummary, doctor,
   buildState, procs, ports, invalidate,
+  probe, healthFor,
   getAlerts: () => alerts,
   resetAlerts: () => { alerts = []; },
-  _caches: { rootSeen, sibSaid }
+  _caches: { rootSeen, sibSaid, health, speaksHttp }
 };
 
 // require.main is this module only when node was pointed straight at this file. Under

@@ -33,7 +33,7 @@ const path = require('path');
 
 let child = null;         // the PortDash under test
 let started = [];         // pgids of anything the tests asked it to start
-let UI = 0, APP = 0, TOKEN = '', HOME = '', boot = '';
+let UI = 0, APP = 0, TCPP = 0, WEDGE = 0, TOKEN = '', HOME = '', boot = '';
 
 /** Nothing survives this file, however it ends — a thrown assertion, a crash, ^C. */
 function cleanup() {
@@ -74,20 +74,28 @@ const get = (url) => request('GET', url);
 const post = (url, body) => request('POST', url, body || {});
 const state = async () => JSON.parse((await get('/api/state')).body);
 
-/** A home directory with one project in it, both invented here. */
+/** A home directory with three projects in it, all invented here: one that serves HTTP,
+    one that accepts a connection and hangs up without a word — a database, as far as a
+    health check can tell — and one that accepts and then says nothing at all, which is
+    what a wedged dev server looks like from outside. */
 function sandbox() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'portdash-test-'));
   const root = path.join(home, '.portdash');
   fs.mkdirSync(root, { recursive: true });
 
-  const proj = path.join(home, 'fixture-app');
-  fs.mkdirSync(proj);
-  fs.writeFileSync(path.join(proj, 'server.js'),
-    `require('http').createServer((q, s) => s.end('ok')).listen(${APP}, '127.0.0.1');\n`);
+  const fixture = (id, port, body) => {
+    const dir = path.join(home, id);
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'server.js'), body + '\n');
+    return { id, name: id, cwd: dir, cmd: 'node server.js', kind: 'node',
+             port, memMB: null, heapMB: null, pinned: false };
+  };
 
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({
     uiPort: UI,
     scanRoots: [],                      // never walk the disk of whoever is running this
+    // Two seconds instead of sixty, so "it has had long enough" is reachable in a test.
+    readyGraceSec: 2,
     limits: {
       enabled: true,                    // still running, still sampling, still reporting
       projectRssMB: 1e9, hardRssMB: 1e9, nodeHeapMB: 3072,
@@ -96,11 +104,36 @@ function sandbox() {
     }
   }, null, 2));
   fs.writeFileSync(path.join(root, 'projects.json'), JSON.stringify([
-    { id: 'fixture', name: 'fixture-app', cwd: proj, cmd: 'node server.js', kind: 'node',
-      port: APP, memMB: null, heapMB: null, pinned: false }
+    fixture('fixture-app', APP,
+      `require('http').createServer((q, s) => s.end('ok')).listen(${APP}, '127.0.0.1');`),
+    fixture('tcp-only', TCPP,
+      `require('net').createServer((s) => s.end()).listen(${TCPP}, '127.0.0.1');`),
+    fixture('wedged', WEDGE,
+      `require('net').createServer(() => {}).listen(${WEDGE}, '127.0.0.1');`)
   ], null, 2));
   fs.writeFileSync(path.join(root, 'state.json'), '{}');
   return home;
+}
+
+/** One project's row, by id — the tests must not depend on the order of the registry. */
+const row = async (id) => (await state()).projects.find((p) => p.id === id);
+
+/** Poll a row until `ok` is happy with it, or give up and return the last one seen so
+    the assertion that follows can say what it actually got. */
+async function until(id, ok, tries) {
+  let last = null;
+  for (let i = 0; i < (tries || 60); i++) {
+    last = await row(id);
+    if (last && ok(last)) return last;
+    await sleep(200);
+  }
+  return last;
+}
+
+async function start(id) {
+  const r = await post('/api/start', { id });
+  assert.equal(r.code, 200, 'starting ' + id + ': ' + r.body);
+  started.push(JSON.parse(r.body).pid);       // detached, so pid is also the group
 }
 
 const registry = () => JSON.parse(fs.readFileSync(path.join(HOME, '.portdash', 'projects.json'), 'utf8'));
@@ -110,6 +143,8 @@ describe('a running PortDash', () => {
   before(async () => {
     UI = await freePort();
     APP = await freePort();
+    TCPP = await freePort();
+    WEDGE = await freePort();
     HOME = sandbox();
 
     child = spawn(process.execPath, [path.join(__dirname, 'portdash.js')], {
@@ -131,7 +166,9 @@ describe('a running PortDash', () => {
   });
 
   after(async () => {
-    if (child && TOKEN) { try { await post('/api/stop', { id: 'fixture' }); } catch (e) {} }
+    for (const id of ['fixture-app', 'tcp-only', 'wedged']) {
+      if (child && TOKEN) { try { await post('/api/stop', { id }); } catch (e) {} }
+    }
     cleanup();
     if (HOME) fs.rmSync(HOME, { recursive: true, force: true });
   });
@@ -154,11 +191,12 @@ describe('a running PortDash', () => {
     assert.equal((await get('/api/state')).code, 200);
   });
 
-  it('reports the fixture project and the machine\'s other listeners', async () => {
+  it('reports the fixture projects and the machine\'s other listeners', async () => {
     const s = await state();
-    assert.equal(s.projects.length, 1);
-    assert.equal(s.projects[0].name, 'fixture-app');
-    assert.equal(s.projects[0].status, 'stopped');
+    assert.equal(s.projects.length, 3);
+    assert.ok(s.projects.every((p) => p.status === 'stopped'));
+    // Nothing to ask a stopped project about, so nothing is claimed about it.
+    assert.ok(s.projects.every((p) => p.health === null));
     assert.ok(Array.isArray(s.others));
   });
 
@@ -204,22 +242,56 @@ describe('a running PortDash', () => {
   // than one test with three names' worth of assertions in it.
 
   it('starts a project, and shows it in the very next render', async () => {
-    const r = await post('/api/start', { id: 'fixture' });
-    assert.equal(r.code, 200, r.body);
-    const pid = JSON.parse(r.body).pid;
-    started.push(pid);                           // detached, so pid is also the group
+    await start('fixture-app');
 
     // Not "eventually": immediately. The samples behind /api/state are dropped when
     // something is started, so a stale one cannot be served over the top of it.
-    const row = (await state()).projects[0];
-    assert.equal(row.status, 'running');
-    assert.equal(row.pid, pid);
-    assert.equal(row.owner.kind, 'portdash');
+    const r = await row('fixture-app');
+    assert.equal(r.status, 'running');
+    assert.ok(r.pid);
+    assert.equal(r.owner.kind, 'portdash');
 
-    for (let i = 0; i < 40 && !(await state()).projects[0].ports.includes(APP); i++) await sleep(150);
-    assert.ok((await state()).projects[0].ports.includes(APP),
-      'it should be listening on ' + APP);
+    const listening = await until('fixture-app', (x) => x.ports.includes(APP));
+    assert.ok(listening.ports.includes(APP), 'it should be listening on ' + APP);
     assert.equal((await get('/')).code, 200, 'the dashboard should still be answering');
+  });
+
+  it('says a service is ready only once the port has actually answered', async () => {
+    // The point of the whole check: "running" is a fact about the process table, and
+    // "ready" is a fact about whether the thing can be used. This one is both.
+    const r = await until('fixture-app', (x) => x.health && x.health.state === 'ready');
+    assert.equal(r.health.state, 'ready', JSON.stringify(r.health));
+    assert.equal(r.health.via, 'http');
+    assert.equal(r.health.port, APP);
+  });
+
+  it('does not call a service broken for failing to speak HTTP', async () => {
+    // A database accepts the connection and hangs up. It is not answering HTTP and it
+    // is not supposed to; reporting it as unreachable would be a false alarm on every
+    // non-web service anyone registers.
+    await start('tcp-only');
+    const r = await until('tcp-only', (x) => x.health && x.health.state === 'ready');
+    assert.equal(r.health.state, 'ready', JSON.stringify(r.health));
+    assert.equal(r.health.via, 'tcp');
+    assert.equal((await post('/api/stop', { id: 'tcp-only' })).code, 200);
+  });
+
+  it('catches the one ps cannot: listening, accepting, never answering', async () => {
+    // The wedged dev server. The process is alive, the port is open, lsof is happy and
+    // ps is happy — and the page never loads. Before this check the row was green.
+    await start('wedged');
+    const open = await until('wedged', (x) => x.ports.includes(WEDGE));
+    assert.ok(open.ports.includes(WEDGE), 'it should be listening on ' + WEDGE);
+
+    // Under the grace it is "starting", because a service that has just come up and is
+    // still compiling looks exactly like this and must not be called broken.
+    assert.match(String((open.health || {}).state), /^(starting|checking)$/);
+
+    const r = await until('wedged', (x) => x.health && x.health.state === 'unreachable');
+    assert.equal(r.health.state, 'unreachable', JSON.stringify(r.health));
+    assert.match(r.health.why, new RegExp('no answer from :' + WEDGE));
+    assert.equal(r.status, 'running', 'the process is alive; that was never in doubt');
+    assert.equal((await post('/api/stop', { id: 'wedged' })).code, 200);
   });
 
   it('refuses to start something else onto a port that is taken', async () => {
@@ -241,15 +313,11 @@ describe('a running PortDash', () => {
   });
 
   it('stops it, and the row goes back to stopped', async () => {
-    assert.equal((await post('/api/stop', { id: 'fixture' })).code, 200);
-    let row;
-    for (let i = 0; i < 40; i++) {
-      row = (await state()).projects[0];
-      if (row.status === 'stopped') break;
-      await sleep(150);
-    }
-    assert.equal(row.status, 'stopped');
-    assert.equal(row.pid, null);
+    assert.equal((await post('/api/stop', { id: 'fixture-app' })).code, 200);
+    const r = await until('fixture-app', (x) => x.status === 'stopped');
+    assert.equal(r.status, 'stopped');
+    assert.equal(r.pid, null);
+    assert.equal(r.health, null, 'a stopped row should claim nothing about its health');
     started.length = 0;
   });
 

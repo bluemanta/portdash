@@ -273,6 +273,66 @@ describe('explaining a start that failed', () => {
   });
 });
 
+// ------------------------------------------------------- running vs usable
+
+describe('what a row should say about itself', () => {
+  // healthFor turns one probe result plus the age of the process into the word on the
+  // row. The probe is the easy half; this is where the judgement is, and all of it is
+  // about not crying wolf at a service that is simply still starting up.
+  const seed = (port, r) => { pd._caches.health[port] = Object.assign({ at: Date.now() }, r); };
+  const forget = (port) => { delete pd._caches.health[port]; };
+  const GRACE = 60;
+
+  it('asks nothing of a project that is not running', () => {
+    assert.equal(pd.healthFor('stopped', [], null, GRACE), null);
+    // A frozen one is frozen by our own hand. It would probe as unreachable, and that
+    // would read as a fault rather than as the state we deliberately put it in.
+    assert.equal(pd.healthFor('paused', [3000], '01:00', GRACE), null);
+  });
+
+  it('gives a service that has not opened a port yet the benefit of the doubt', () => {
+    assert.deepEqual(pd.healthFor('running', [], '00:05', GRACE),
+                     { state: 'starting', why: 'no port open yet' });
+  });
+
+  it('stops giving it once the grace has run out', () => {
+    const h = pd.healthFor('running', [], '10:00', GRACE);
+    assert.equal(h.state, 'unreachable');
+    assert.match(h.why, /not listening on any port/);
+  });
+
+  it('says so plainly before the first probe has come back', () => {
+    forget(3000);
+    assert.deepEqual(pd.healthFor('running', [3000], '10:00', GRACE), { state: 'checking', port: 3000 });
+  });
+
+  it('is ready when the port answered, whatever it answered with', () => {
+    seed(3000, { open: true, answered: true, via: 'http', ms: 4 });
+    assert.deepEqual(pd.healthFor('running', [3000], '10:00', GRACE),
+                     { state: 'ready', port: 3000, via: 'http', ms: 4 });
+    // A database is not broken for failing to speak HTTP.
+    seed(5432, { open: true, answered: true, via: 'tcp', ms: 2 });
+    assert.equal(pd.healthFor('running', [5432], '10:00', GRACE).state, 'ready');
+  });
+
+  it('calls a port that is open but silent starting, then not answering', () => {
+    // The wedged dev server: listening, accepting connections, never replying. ps says
+    // it is fine, and it is the case this whole check exists for.
+    seed(3000, { open: true, answered: false, via: null, ms: 2000 });
+    assert.equal(pd.healthFor('running', [3000], '00:05', GRACE).state, 'starting');
+    const h = pd.healthFor('running', [3000], '10:00', GRACE);
+    assert.equal(h.state, 'unreachable');
+    assert.match(h.why, /no answer from :3000/);
+  });
+
+  it('judges the port it is actually on, not the one it was configured for', () => {
+    // Probing a configured port a project isn't listening on would find whatever else
+    // happens to be there and report this project as ready on the strength of it.
+    seed(3000, { open: true, answered: true, via: 'http', ms: 1 });
+    assert.equal(pd.healthFor('running', [], '00:01', GRACE).state, 'starting');
+  });
+});
+
 // ------------------------------------------------- not signalling a stranger
 
 describe('not signalling the wrong process', () => {
