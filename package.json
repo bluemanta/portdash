@@ -25,7 +25,8 @@
     "portdash": "portdash.js"
   },
   "scripts": {
-    "start": "node portdash.js"
+    "start": "node portdash.js",
+    "test": "d=$(mktemp -d) && HOME=$d node --test; s=$?; rm -rf \"$d\"; exit $s"
   },
   "files": [
     "portdash.js",
