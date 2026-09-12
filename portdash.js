@@ -1945,9 +1945,16 @@ function uninstallAgent() {
 
 // ---------------------------------------------------------------- boot
 
-const argv = process.argv.slice(2);
-if (argv.includes('--help') || argv.includes('-h')) {
-  console.log(`PortDash — a visual control panel for local dev servers
+/**
+ * Everything with an effect lives in here: reading argv, writing a default config,
+ * binding the port, starting the watchdog. Nothing above this line does anything on its
+ * own, which is what lets test.js require this file and ask it questions without a
+ * dashboard appearing on port 7777 as a side effect of running the tests.
+ */
+function main() {
+  const argv = process.argv.slice(2);
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log(`PortDash — a visual control panel for local dev servers
 
   portdash                    start the dashboard and watchdog
   portdash --install-agent    run at login as a background LaunchAgent (macOS)
@@ -1955,62 +1962,87 @@ if (argv.includes('--help') || argv.includes('-h')) {
   portdash --version          print the version
 
 Config, logs and the API token live in ~/.portdash/`);
-  process.exit(0);
-}
-if (argv.includes('--version') || argv.includes('-v')) {
-  console.log(readJSON(path.join(__dirname, 'package.json'), { version: 'unknown' }).version);
-  process.exit(0);
-}
-if (argv.includes('--install-agent')) {
-  // installAgent checks the toolchain the same way the dashboard does, which is
-  // asynchronous now, so this branch can't fall through the way the others do: the boot
-  // below would bind a port and start a watchdog on the way out of an install. A
-  // top-level return is how a CommonJS script stops without nesting everything after it.
-  installAgent().then(() => process.exit(0),
-                      (e) => { console.error(String((e && e.message) || e)); process.exit(1); });
-  return;
-}
-if (argv.includes('--uninstall-agent')) { uninstallAgent(); process.exit(0); }
-
-ensure();
-if (!fs.existsSync(F_CFG)) writeJSON(F_CFG, DEFAULT_CFG);
-if (!fs.existsSync(F_REG)) logLine(`First run: found ${scanProjects().added} project(s)`);
-
-const cfg0 = getCfg();
-let watchdogTimer = null;
-let bindTries = 0;
-
-server.listen(cfg0.uiPort, '127.0.0.1', () => {
-  bindTries = 0;
-  // Only once we own the port, so a second copy waiting to bind never runs a
-  // competing watchdog against the same processes.
-  if (!watchdogTimer) watchdogTimer = setInterval(watchdog, 2000);
-
-  const sm = sysMem();
-  logLine(`PortDash → http://localhost:${cfg0.uiPort}`);
-  const e = getEnv();
-  logLine(`  ${envSummary(e)}`);
-  if (!e.hasNode) {
-    alert_('warn', "PortDash can't find Node.js in the environment it would start services with, so Node projects will fail to start. Open \"Environment\" to see what it can see.",
-           null, 'env:nonode', { act: 'recheck-env', label: 'Recheck environment' });
+    process.exit(0);
   }
-  logLine(`  Memory protection: ${cfg0.limits.enabled ? 'on' : 'off'}` +
-    (cfg0.limits.enabled
-      ? ` (freeze at ${cfg0.limits.projectRssMB}M / kill at ${cfg0.limits.hardRssMB}M per project, node heap ${cfg0.limits.nodeHeapMB}M)`
-      : ''));
-  if (sm) logLine(`  System: ${sm.availPct}% available of ${(sm.totalMB / 1024).toFixed(0)}G, swap used ${sm.swapUsedMB}M`);
-  logLine(`  Config: ${F_CFG}`);
-  console.log(`  Ctrl+C to quit (won't affect services already started)\n`);
-});
-
-server.on('error', (e) => {
-  if (e.code !== 'EADDRINUSE') throw e;
-  // Exiting here would make launchd restart us immediately and spin. Wait instead:
-  // usually it's another PortDash, and if that one goes away we take over.
-  bindTries++;
-  const wait = Math.min(60, 5 * Math.min(bindTries, 12));
-  if (bindTries === 1) {
-    logLine(`Port ${cfg0.uiPort} is in use — retrying every ${wait}s. Change uiPort in ${F_CFG} to use another.`);
+  if (argv.includes('--version') || argv.includes('-v')) {
+    console.log(readJSON(path.join(__dirname, 'package.json'), { version: 'unknown' }).version);
+    process.exit(0);
   }
-  setTimeout(() => server.listen(cfg0.uiPort, '127.0.0.1'), wait * 1000);
-});
+  if (argv.includes('--install-agent')) {
+    // installAgent checks the toolchain the same way the dashboard does, which is
+    // asynchronous now, so this branch can't fall through the way the others do: the
+    // boot below would bind a port and start a watchdog on the way out of an install.
+    installAgent().then(() => process.exit(0),
+                        (e) => { console.error(String((e && e.message) || e)); process.exit(1); });
+    return;
+  }
+  if (argv.includes('--uninstall-agent')) { uninstallAgent(); process.exit(0); }
+
+  ensure();
+  if (!fs.existsSync(F_CFG)) writeJSON(F_CFG, DEFAULT_CFG);
+  if (!fs.existsSync(F_REG)) logLine(`First run: found ${scanProjects().added} project(s)`);
+
+  const cfg0 = getCfg();
+  let watchdogTimer = null;
+  let bindTries = 0;
+
+  server.listen(cfg0.uiPort, '127.0.0.1', () => {
+    bindTries = 0;
+    // Only once we own the port, so a second copy waiting to bind never runs a
+    // competing watchdog against the same processes.
+    if (!watchdogTimer) watchdogTimer = setInterval(watchdog, 2000);
+
+    const sm = sysMem();
+    logLine(`PortDash → http://localhost:${cfg0.uiPort}`);
+    const e = getEnv();
+    logLine(`  ${envSummary(e)}`);
+    if (!e.hasNode) {
+      alert_('warn', "PortDash can't find Node.js in the environment it would start services with, so Node projects will fail to start. Open \"Environment\" to see what it can see.",
+             null, 'env:nonode', { act: 'recheck-env', label: 'Recheck environment' });
+    }
+    logLine(`  Memory protection: ${cfg0.limits.enabled ? 'on' : 'off'}` +
+      (cfg0.limits.enabled
+        ? ` (freeze at ${cfg0.limits.projectRssMB}M / kill at ${cfg0.limits.hardRssMB}M per project, node heap ${cfg0.limits.nodeHeapMB}M)`
+        : ''));
+    if (sm) logLine(`  System: ${sm.availPct}% available of ${(sm.totalMB / 1024).toFixed(0)}G, swap used ${sm.swapUsedMB}M`);
+    logLine(`  Config: ${F_CFG}`);
+    console.log(`  Ctrl+C to quit (won't affect services already started)\n`);
+  });
+
+  server.on('error', (e) => {
+    if (e.code !== 'EADDRINUSE') throw e;
+    // Exiting here would make launchd restart us immediately and spin. Wait instead:
+    // usually it's another PortDash, and if that one goes away we take over.
+    bindTries++;
+    const wait = Math.min(60, 5 * Math.min(bindTries, 12));
+    if (bindTries === 1) {
+      logLine(`Port ${cfg0.uiPort} is in use — retrying every ${wait}s. Change uiPort in ${F_CFG} to use another.`);
+    }
+    setTimeout(() => server.listen(cfg0.uiPort, '127.0.0.1'), wait * 1000);
+  });
+}
+
+/**
+ * The internals, for test.js. Not an API: these are exported so the decisions they
+ * encode can be pinned down, and several of them look like mistakes until you read the
+ * test that explains why they are not.
+ *
+ * _caches holds two module-level caches. A test needs to put a known value into one
+ * rather than depend on whatever this particular machine happens to be running.
+ */
+module.exports = {
+  procName, ancestors, ownerOf, stopCommand, launchdJobs,
+  isPortdash, supersededBy,
+  detectProject, staticCmd, freeStaticPort, idOf, registrable, scanProjects,
+  diagnose, missingCommand, lastLine, syncedFolder,
+  etimeToSec, sameProcess, processTable, listeners, sysMem,
+  whichIn, envSummary, doctor,
+  buildState, procs, ports, invalidate,
+  getAlerts: () => alerts,
+  resetAlerts: () => { alerts = []; },
+  _caches: { rootSeen, sibSaid }
+};
+
+// require.main is this module only when node was pointed straight at this file. Under
+// `node --test` the runner is main, so requiring this from a test starts nothing.
+if (require.main === module) main();
