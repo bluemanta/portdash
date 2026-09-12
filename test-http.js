@@ -130,10 +130,18 @@ async function until(id, ok, tries) {
   return last;
 }
 
+/** Start a fixture, waiting out the double-click guard. That guard holds an id for three
+    seconds after a start, and several of these tests use the same fixture in quicker
+    succession than a person would — the guard is right, the test just has to be patient
+    about it rather than the product being loosened to suit the test. */
 async function start(id) {
-  const r = await post('/api/start', { id });
-  assert.equal(r.code, 200, 'starting ' + id + ': ' + r.body);
-  started.push(JSON.parse(r.body).pid);       // detached, so pid is also the group
+  for (let i = 0; i < 25; i++) {
+    const r = await post('/api/start', { id });
+    if (r.code === 200) { started.push(JSON.parse(r.body).pid); return; }   // detached: pid is the group
+    if (!/Already starting/.test(r.body)) assert.fail('starting ' + id + ': ' + r.body);
+    await sleep(300);
+  }
+  assert.fail('starting ' + id + ': still "already starting" after seven seconds');
 }
 
 const registry = () => JSON.parse(fs.readFileSync(path.join(HOME, '.portdash', 'projects.json'), 'utf8'));
@@ -362,6 +370,55 @@ describe('a running PortDash', () => {
     assert.equal((await post('/api/stop', { id: 'fixture-app' })).code, 200);
     await until('fixture-app', (x) => x.status === 'stopped');
     started.length = 0;
+  });
+
+  it('remembers that a project should never be frozen automatically', async () => {
+    // The escape hatch for something that legitimately gets heavy. Before it existed the
+    // only way out was typing a number large enough to never be reached, which is a
+    // workaround rather than an answer, and says nothing about intent to the next reader.
+    const r = await post('/api/save', { id: 'fixture-app', name: 'fixture-app',
+                                        cmd: 'node server.js', port: APP, noFreeze: true });
+    assert.equal(r.code, 200, r.body);
+    assert.equal(registry().find((p) => p.id === 'fixture-app').noFreeze, true);
+    assert.equal((await row('fixture-app')).noFreeze, true, 'and the row should carry it');
+
+    await post('/api/save', { id: 'fixture-app', name: 'fixture-app',
+                              cmd: 'node server.js', port: APP, noFreeze: false });
+    assert.equal(registry().find((p) => p.id === 'fixture-app').noFreeze, false);
+  });
+
+  it('raises a limit and thaws in one action', async () => {
+    // Two steps would mean thawing something still over its limit, and the watchdog
+    // would freeze it again within two seconds — the button would look broken. So the
+    // limit is written first, and this asserts the thaw actually happened.
+    await start('fixture-app');
+    await until('fixture-app', (x) => x.ports.includes(APP));
+    assert.equal((await post('/api/pause', { id: 'fixture-app' })).code, 200);
+    const frozen = await until('fixture-app', (x) => x.status === 'paused');
+    assert.equal(frozen.status, 'paused');
+
+    const r = await post('/api/raise-limit', { id: 'fixture-app', memMB: 8192 });
+    assert.equal(r.code, 200, r.body);
+    assert.equal(JSON.parse(r.body).memMB, 8192);
+
+    assert.equal(registry().find((p) => p.id === 'fixture-app').memMB, 8192);
+    const thawed = await until('fixture-app', (x) => x.status === 'running');
+    assert.equal(thawed.status, 'running', 'raising the limit should have let it carry on');
+    assert.equal(thawed.memLimit, 8192);
+
+    assert.equal((await post('/api/stop', { id: 'fixture-app' })).code, 200);
+    await until('fixture-app', (x) => x.status === 'stopped');
+    started.length = 0;
+    const reg = registry();
+    reg.find((p) => p.id === 'fixture-app').memMB = null;
+    setRegistry(reg);
+  });
+
+  it('refuses a memory limit that is not one', async () => {
+    for (const memMB of [0, -1, 'lots', null, 12]) {
+      const r = await post('/api/raise-limit', { id: 'fixture-app', memMB });
+      assert.equal(r.code, 400, 'accepted ' + JSON.stringify(memMB));
+    }
   });
 
   it('ships a page whose script and markup agree', async () => {

@@ -380,12 +380,16 @@ const saveManaged = () => writeJSON(F_STATE, managed);
 
 let alerts = [];
 const alertSeen = {};                 // don't flood with the same alert more than once per 60s
-function alert_(level, text, projectId, key, action) {
+/** `actions` is a list because the useful answer to "I froze this" is rarely one thing:
+    the person either wants it back as it was, or wants it back with room to finish. An
+    alert that only explains leaves them to go and find the controls themselves. */
+function alert_(level, text, projectId, key, actions) {
   const k = key || (level + ':' + text);
   const now = Date.now();
   if (alertSeen[k] && now - alertSeen[k] < 60000) return;
   alertSeen[k] = now;
-  alerts.unshift({ id: crypto.randomBytes(4).toString('hex'), t: now, level, text, projectId, action });
+  alerts.unshift({ id: crypto.randomBytes(4).toString('hex'), t: now, level, text, projectId,
+                   actions: actions || [] });
   alerts = alerts.slice(0, 20);
   logLine(`[${level === 'danger' ? 'action' : 'notice'}] ${text}`);
   if (projectId) {
@@ -455,7 +459,7 @@ function diagnose(output, code, project) {
     const cmd = nf || (project && project.cmd || '').split(/\s+/)[0] || 'that command';
     return {
       text: `"${name}" couldn't start: ${cmd} isn't on the PATH PortDash is using. That usually means PortDash was launched at login and can't see the tools your terminal can. Recheck the environment, then start it again.`,
-      action: { act: 'recheck-env', label: 'Recheck environment' }
+      actions: [{ act: 'recheck-env', label: 'Recheck environment' }]
     };
   }
   if (/EADDRINUSE|address already in use|port .*already in use/i.test(t)) {
@@ -1293,7 +1297,7 @@ function startProject(id) {
     if (Date.now() - now > 4000) return;
     const d = diagnose(logSlice(logFile, logFrom, 8192), code, p);
     if (managed[id] && managed[id].pid === child.pid) { delete managed[id]; saveManaged(); }
-    alert_('danger', d.text, id, 'exit:' + id, d.action);
+    alert_('danger', d.text, id, 'exit:' + id, d.actions);
   });
   child.unref();                     // unref only stops the child holding the event loop
                                      // open; the exit listener above still fires
@@ -1372,6 +1376,20 @@ async function restartProject(id) {
 
 // ---------------------------------------------------------------- memory watchdog
 
+/** Below this a limit isn't a safety net, it's a service that can never finish starting.
+    Both the offer in the freeze notice and the endpoint behind it measure against it —
+    they were separately invented before, and disagreed: the notice would offer to raise
+    a 40M limit to 80M and the endpoint would refuse the number it had just proposed. */
+const MIN_LIMIT_MB = 256;
+
+/** A roomier limit to offer after a freeze, or null when there is nothing worth
+    offering. Raising the soft limit to meet the hard one is not a favour: it turns the
+    next freeze into a kill. */
+function roomierLimit(currentMB, hardMB) {
+  const next = Math.max(currentMB * 2, MIN_LIMIT_MB);
+  return next < hardMB ? next : null;
+}
+
 function watchdog() {
   const lim = getCfg().limits;
   if (!lim.enabled) return;
@@ -1411,7 +1429,8 @@ function watchdog() {
       id, name: p.name, pgid: info.pgid,
       rss: Math.round(rssByPgid[info.pgid] || info.rssMB || 0),
       paused: !!(info.stat && info.stat.startsWith('T')),
-      limit: p.memMB || lim.projectRssMB
+      limit: p.memMB || lim.projectRssMB,
+      noFreeze: !!p.noFreeze
     });
   }
 
@@ -1425,11 +1444,22 @@ function watchdog() {
   }
 
   // 2) soft per-project limit → freeze (preserves the crash scene so you can inspect logs before deciding)
+  //
+  // Freezing is only half an answer. Being told a service was frozen and then having to
+  // go and find the controls yourself is how a safety net starts feeling like an
+  // obstacle — especially when the memory was legitimate and the thing was halfway
+  // through a scan. So the notice carries the two answers anyone actually wants: put it
+  // back as it was, or give it room and put it back.
   for (const r of running) {
-    if (!r.paused && r.rss > r.limit && r.rss <= lim.hardRssMB) {
-      signalGroup(r.pgid, 'SIGSTOP');
-      alert_('danger', `"${r.name}" reached ${fmtMB(r.rss)}, over its limit of ${fmtMB(r.limit)} — auto-frozen. The process is still there; check the logs, then "Resume" or "Stop".`, r.id, 'soft:' + r.id);
+    if (r.paused || r.noFreeze || r.rss <= r.limit || r.rss > lim.hardRssMB) continue;
+    signalGroup(r.pgid, 'SIGSTOP');
+    const roomier = roomierLimit(r.limit, lim.hardRssMB);
+    const actions = [{ act: 'resume', id: r.id, label: 'Resume' }];
+    if (roomier) {
+      actions.push({ act: 'raise', id: r.id, mb: roomier, label: `Allow ${fmtMB(roomier)} and resume` });
     }
+    alert_('danger', `"${r.name}" reached ${fmtMB(r.rss)}, over its limit of ${fmtMB(r.limit)} — auto-frozen. The process is still there, holding its memory and its ports; check the logs, then resume it, give it more room, or stop it. To stop this happening again, turn on "never freeze this one" under "Edit".`,
+           r.id, 'soft:' + r.id, actions);
   }
 
   // 3) system-wide pressure → freeze whoever's using the most (only touches processes
@@ -1453,7 +1483,10 @@ function watchdog() {
   // back — it just breaks the user's work for nothing.
   if (victim && victim.rss >= lim.minVictimMB) {
     signalGroup(victim.pgid, 'SIGSTOP');
-    alert_('danger', `${why} — froze "${victim.name}" (${fmtMB(victim.rss)}), the biggest consumer, to protect the system.`, victim.id, 'sys:' + victim.id);
+    // No "allow more" here: the machine ran out, not this project's own allowance, so
+    // raising its limit would change nothing about why it was frozen.
+    alert_('danger', `${why} — froze "${victim.name}" (${fmtMB(victim.rss)}), the biggest consumer, to protect the system. Close something else, then resume it.`,
+           victim.id, 'sys:' + victim.id, [{ act: 'resume', id: victim.id, label: 'Resume' }]);
   } else if (victim) {
     alert_('warn', `${why}, but the biggest thing PortDash started is only "${victim.name}" (${fmtMB(victim.rss)}) — freezing it wouldn't help, so it's been left alone.`, null, 'sys:small');
   } else {
@@ -1576,8 +1609,28 @@ const server = http.createServer(async (req, res) => {
         p.port = body.port ? parseInt(body.port, 10) : null;
         p.memMB = body.memMB ? parseInt(body.memMB, 10) : null;
         p.heapMB = body.heapMB ? parseInt(body.heapMB, 10) : null;
+        p.noFreeze = !!body.noFreeze;
         setReg(reg);
         return json(res, 200, { ok: true });
+      }
+      // Raise a project's own memory limit and let it carry on, in one action. Two
+      // separate steps would mean thawing something that is still over its limit, so the
+      // watchdog would freeze it again within two seconds and the button would look
+      // broken. The new limit is written first for that reason.
+      if (u.pathname === '/api/raise-limit') {
+        const reg = getReg();
+        const p = reg.find((x) => x.id === body.id);
+        if (!p) throw new Error('Project not found');
+        const mb = parseInt(body.memMB, 10);
+        if (!Number.isInteger(mb) || mb < MIN_LIMIT_MB) {
+          throw new Error(`Not a usable memory limit: ${body.memMB} — anything under ${MIN_LIMIT_MB}M would freeze the service again before it finished starting.`);
+        }
+        p.memMB = mb;
+        setReg(reg);
+        const st = buildState(true).projects.find((x) => x.id === body.id);
+        refuseSelf(st);
+        if (st && st.pgid) signalGroup(st.pgid, 'SIGCONT');
+        return json(res, 200, { ok: true, memMB: mb, resumed: !!(st && st.pgid) });
       }
       if (u.pathname === '/api/pin') {
         const reg = getReg();
@@ -1723,7 +1776,7 @@ input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px
 .two{display:flex;gap:12px}.two>div{flex:1}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;max-height:56vh;
   overflow:auto;font:12px/1.6 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all}
-.alert .go{margin-left:auto;flex:none;align-self:center}
+.alert .go{margin-left:auto;flex:none;align-self:center;display:flex;gap:6px}
 .chk{display:flex;align-items:baseline;gap:9px;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
 .chk:last-child{border-bottom:0}
 .chk .k{width:82px;flex:none;color:var(--dim);font-size:12px}
@@ -1768,6 +1821,14 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     Default port is the address PortDash opens, pins and checks for conflicts before
     starting. It does not change what the program listens on — that comes from the start
     command or the project's own config. Leave it blank if you're not sure.
+  </div>
+  <label style="display:flex;align-items:center;gap:8px;margin:16px 0 0;color:var(--tx);font-size:14px">
+    <input type="checkbox" id="e_nofreeze" style="width:auto;margin:0"> Never freeze this one automatically
+  </label>
+  <div class="sub" style="font-size:12px;margin-top:4px">
+    For something that legitimately gets heavy — a scan, an import, a long build. Its own
+    memory limit above stops applying. The hard limit still does, and so does the
+    system-wide guard if the whole machine runs out of memory.
   </div>
   <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px">
     <button onclick="edit.close()">Cancel</button>
@@ -1850,11 +1911,12 @@ function open_(port){ window.open('http://localhost:'+port,'_blank'); }
 function openEdit(p){
   editingId=p.id; e_cwd.textContent=p.cwdShort; e_name.value=p.name;
   e_cmd.value=p.cmd||''; e_port.value=p.port||''; e_mem.value=p.memMB||''; e_heap.value=p.heapMB||'';
+  e_nofreeze.checked=!!p.noFreeze;
   edit.showModal();
 }
 async function saveEdit(){
   await api('/api/save',{id:editingId,name:e_name.value,cmd:e_cmd.value,port:e_port.value,
-                         memMB:e_mem.value,heapMB:e_heap.value});
+                         memMB:e_mem.value,heapMB:e_heap.value,noFreeze:e_nofreeze.checked});
   edit.close(); load();
 }
 async function showLogs(p){
@@ -1899,11 +1961,15 @@ async function remove(p){
   await act('/api/remove',{id:p.id});
 }
 
-function btn(a,id,label,cls){
-  return '<button class="'+(cls||'')+'" data-act="'+a+'" data-id="'+id+'">'+label+'</button>';
+function btn(a,id,label,cls,title){
+  return '<button class="'+(cls||'')+'"'+(title?' title="'+esc(title)+'"':'')
+    +' data-act="'+a+'" data-id="'+id+'">'+label+'</button>';
 }
-function memTag(rss,limit){
+function memTag(rss,limit,noFreeze){
   if(!rss) return '';
+  // Exempt from its own limit, so the bar has nothing to fill toward. Showing one
+  // creeping into red would be promising a freeze that is never coming.
+  if(noFreeze) return '<span class="tag mem" title="Not frozen automatically">'+gb(rss)+'</span>';
   const pct=limit?rss/limit:0;
   const cls=pct>=.85?'bad':pct>=.6?'warn':'';
   const w=Math.min(100,Math.round(pct*100));
@@ -1996,7 +2062,8 @@ function projectRow(p){
   // Something launchd supervises can't be stopped from here in any way that lasts, so
   // the button opens an explanation and the command that does work.
   const stopBtn=(p.owner&&p.owner.kind==='launchd')
-    ? btn('supervised',p.id,'Stop…','d') : btn('stop',p.id,'Stop','d');
+    ? btn('supervised',p.id,'Stop…','d','Something else supervises this — see what actually stops it')
+    : btn('stop',p.id,'Stop','d','Stop it and give back its memory and its ports.');
   // Restart is stop-then-start, so it is only an offer PortDash can keep when it knows
   // how to start the thing and nothing else is going to beat it to it. On a launchd job
   // it would stop the service, watch launchd bring it back, and start a second copy; on
@@ -2009,9 +2076,12 @@ function projectRow(p){
   // Start stays even with no command configured: it answers with what to do about that,
   // and the row already says so in orange. Hiding it would leave no way forward.
   else if(p.status==='stopped') acts=openBtn+btn('start',p.id,'Start','p');
+  // Freeze and stop are the pair people get wrong, and the row is where they decide.
   else if(p.status==='running')
-    acts=openBtn+btn('pause',p.id,'Pause')+(canRestart?btn('restart',p.id,'Restart'):'')+stopBtn;
-  else acts=btn('resume',p.id,'Resume','p')+stopBtn;
+    acts=openBtn
+      +btn('pause',p.id,'Pause','','Freeze it where it is. Its memory and ports stay held and requests will hang — Stop is what gives them back.')
+      +(canRestart?btn('restart',p.id,'Restart'):'')+stopBtn;
+  else acts=btn('resume',p.id,'Resume','p','Unfreeze it and let it carry on from where it stopped.')+stopBtn;
   acts+='<span class="sep"></span>'+pinBtn(p)
     +iconBtn('logs',p.id,ICON.logs,'Logs')
     +iconBtn('edit',p.id,ICON.edit,'Edit')
@@ -2019,9 +2089,9 @@ function projectRow(p){
   const badge=ownerTag(p.owner);
   const cmdTxt=p.source==='self'?'serving this dashboard'
              :p.cmd?esc(p.cmd):'<span style="color:var(--pause)">no start command configured</span>';
-  const hot=(p.rssMB&&p.memLimit&&p.rssMB/p.memLimit>=.6)?' hot':'';
+  const hot=(!p.noFreeze&&p.rssMB&&p.memLimit&&p.rssMB/p.memLimit>=.6)?' hot':'';
   return '<div class="row'+hot+'"><span class="dot '+dotClass(p)+'"></span><div class="main">'
-    +'<div class="nm">'+esc(p.name)+ports+healthTag(p)+memTag(p.rssMB,p.memLimit)+badge+'</div>'
+    +'<div class="nm">'+esc(p.name)+ports+healthTag(p)+memTag(p.rssMB,p.memLimit,p.noFreeze)+badge+'</div>'
     +'<div class="meta">'+esc(p.cwdShort)+'  ·  '+cmdTxt
     +(p.etime?'  ·  '+label+' '+esc(p.etime):'')+'</div></div>'
     +'<div class="acts">'+acts+'</div></div>';
@@ -2066,8 +2136,19 @@ document.addEventListener('click', async (e)=>{
     if(r.hasNode) await api('/api/dismiss',{alertId:b.dataset.alert});
     return load();
   }
+  if(a==='raise'){
+    await api('/api/raise-limit',{id:id,memMB:+b.dataset.mb});
+    await api('/api/dismiss',{alertId:b.dataset.alert});
+    return setTimeout(load,350);
+  }
   const M={start:'/api/start',stop:'/api/stop',pause:'/api/pause',resume:'/api/resume',restart:'/api/restart'};
-  if(M[a]) return act(M[a], id?{id:id}:{pid:pid});
+  if(M[a]){
+    await api(M[a], id?{id:id}:{pid:pid});
+    // Resuming from the notice that announced the freeze should clear the notice too.
+    // Leaving it sitting there reads as though the button did nothing.
+    if(b.dataset.alert) await api('/api/dismiss',{alertId:b.dataset.alert});
+    return setTimeout(load,350);
+  }
 });
 
 async function load(){
@@ -2087,7 +2168,10 @@ async function load(){
   }
 
   alerts.innerHTML=(s.alerts||[]).map(a=>'<div class="alert '+a.level+'"><div>'+esc(a.text)+'</div>'
-    +(a.action?'<button class="go" data-act="'+esc(a.action.act)+'" data-alert="'+a.id+'">'+esc(a.action.label)+'</button>':'')
+    +((a.actions||[]).length?'<span class="go">'+a.actions.map(x=>
+        '<button data-act="'+esc(x.act)+'" data-alert="'+a.id+'"'
+        +(x.id?' data-id="'+esc(x.id)+'"':'')+(x.mb?' data-mb="'+x.mb+'"':'')
+        +'>'+esc(x.label)+'</button>').join('')+'</span>':'')
     +'<button class="x" data-act="dismiss" data-alert="'+a.id+'">×</button></div>').join('');
 
   // Pinned rows keep the same place whatever they are doing — sorting them by status
@@ -2259,7 +2343,7 @@ Config, logs and the API token live in ~/.portdash/`);
     logLine(`  ${envSummary(e)}`);
     if (!e.hasNode) {
       alert_('warn', "PortDash can't find Node.js in the environment it would start services with, so Node projects will fail to start. Open \"Environment\" to see what it can see.",
-             null, 'env:nonode', { act: 'recheck-env', label: 'Recheck environment' });
+             null, 'env:nonode', [{ act: 'recheck-env', label: 'Recheck environment' }]);
     }
     logLine(`  Memory protection: ${cfg0.limits.enabled ? 'on' : 'off'}` +
       (cfg0.limits.enabled
@@ -2299,7 +2383,7 @@ module.exports = {
   etimeToSec, sameProcess, processTable, listeners, sysMem,
   whichIn, envSummary, doctor,
   buildState, procs, ports, invalidate,
-  probe, healthFor,
+  probe, healthFor, roomierLimit, MIN_LIMIT_MB,
   getAlerts: () => alerts,
   resetAlerts: () => { alerts = []; },
   _caches: { rootSeen, sibSaid, health, speaksHttp }

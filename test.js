@@ -249,7 +249,13 @@ describe('explaining a start that failed', () => {
   it('offers the environment recheck when a command is missing', () => {
     const d = pd.diagnose('zsh:1: command not found: vite', 127, project);
     assert.match(d.text, /vite isn't on the PATH/);
-    assert.equal(d.action.act, 'recheck-env');
+    assert.deepEqual(d.actions, [{ act: 'recheck-env', label: 'Recheck environment' }]);
+  });
+
+  it('offers nothing to press when there is nothing useful to press', () => {
+    // An alert with no actions is fine. One with a button that doesn't help is worse
+    // than none, because it costs a click to find that out.
+    assert.deepEqual(pd.diagnose('boom', 1, project).actions, undefined);
   });
 
   it('reads the port off the line that complains, not off a stack trace', () => {
@@ -342,6 +348,33 @@ describe('what a row should say about itself', () => {
     // happens to be there and report this project as ready on the strength of it.
     seed(3000, { open: true, answered: true, via: 'http', ms: 1 });
     assert.equal(pd.healthFor('running', [], '00:01', GRACE).state, 'starting');
+  });
+});
+
+// --------------------------------------------------- getting out of a freeze
+
+describe('what to offer after freezing something', () => {
+  it('offers twice what it had', () => {
+    assert.equal(pd.roomierLimit(4096, 10240), 8192);
+  });
+
+  it('never offers a number the endpoint behind the button would refuse', () => {
+    // Found by pressing the button. The notice computed "twice the current limit" and
+    // the endpoint separately required at least MIN_LIMIT_MB, so a project on a 40M
+    // limit was offered 80M and then told 80M was not a usable memory limit. Two places
+    // deciding what counts as valid, and only one of them was consulted.
+    for (const current of [1, 40, 100, 255, 256, 1024, 4096]) {
+      const next = pd.roomierLimit(current, 10240);
+      if (next !== null) assert.ok(next >= pd.MIN_LIMIT_MB, current + ' offered ' + next);
+    }
+    assert.equal(pd.roomierLimit(40, 10240), pd.MIN_LIMIT_MB);
+  });
+
+  it('offers nothing when there is no room left under the hard limit', () => {
+    // Raising the soft limit to meet the hard one turns the next freeze into a kill.
+    assert.equal(pd.roomierLimit(8192, 10240), null);
+    assert.equal(pd.roomierLimit(10240, 10240), null);
+    assert.equal(pd.roomierLimit(64, 200), null);
   });
 });
 
