@@ -143,6 +143,30 @@ describe('who owns a process', () => {
                      { kind: 'portdash' });
   });
 
+  it('knows an app by its own path when launchd has no record of it', () => {
+    // A GUI app's helper whose parent has exited is reparented to launchd and looks
+    // exactly like a stray dev server from the process table. They want opposite
+    // treatment: one you stop from the dashboard, the other you quit from the app.
+    const orphanedHelper = {
+      77: { pid: 77, ppid: 1, command: '/Applications/BaiduNetdisk_mac.app/Contents/Frameworks/netdisk_service' }
+    };
+    assert.deepEqual(pd.ownerOf(77, orphanedHelper, {}), { kind: 'app', label: 'BaiduNetdisk_mac' });
+    // ...and a real stray still reads as one.
+    assert.deepEqual(pd.ownerOf(30, TREE, {}), { kind: 'detached' });
+  });
+
+  it('will not signal one of macOS\'s own agents, even when asked by pid', () => {
+    // The menu bar holds :5000. The UI stops offering it, and this stops the raw-pid
+    // route from being a way around that.
+    assert.throws(() => pd.refuseSystemAgent(
+      { kind: 'launchd', label: 'com.apple.controlcenter', system: true }, 684), /won't signal it/);
+    // Everything else is still the user's business.
+    assert.doesNotThrow(() => pd.refuseSystemAgent(
+      { kind: 'launchd', label: 'homebrew.mxcl.postgresql@16', system: false }, 949));
+    assert.doesNotThrow(() => pd.refuseSystemAgent({ kind: 'detached' }, 60571));
+    assert.doesNotThrow(() => pd.refuseSystemAgent(null, 1234));
+  });
+
   it('otherwise names what started it, or admits it is detached', () => {
     assert.deepEqual(pd.ownerOf(13, TREE, {}), { kind: 'from', label: 'iTerm', pid: 10 });
     assert.deepEqual(pd.ownerOf(30, TREE, {}), { kind: 'detached' });

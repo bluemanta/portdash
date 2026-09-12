@@ -926,9 +926,25 @@ function ownerOf(pid, byPid, jobs) {
     // perfectly correct command for switching off part of the system until next login.
     return { kind: 'launchd', label, stop: stopCommand(label), system: /^com\.apple\./.test(label) };
   }
+  // An executable that lives inside an app bundle is that app, whether or not launchd
+  // has a record of it. A helper whose parent has since exited would otherwise be
+  // indistinguishable from a stray dev server, and they want opposite treatment.
+  const own = /\/([^/]+)\.app\//.exec((byPid[pid] || {}).command || '');
+  if (own) return { kind: 'app', label: own[1] };
+
   const top = up[up.length - 1];
   if (top) return { kind: 'from', label: procName(top.command), pid: top.pid };
   return { kind: 'detached' };
+}
+
+/** macOS's own agents are listed like anything else and some of them hold ports — the
+    menu bar is on :5000. Stopping one switches off part of the system until next login,
+    which is never what someone opening a port dashboard meant to do. The UI doesn't
+    offer it; this is so that asking for it by raw pid doesn't work either. */
+function refuseSystemAgent(owner, pid) {
+  if (owner && owner.kind === 'launchd' && owner.system) {
+    throw new Error(`pid ${pid} is ${owner.label}, one of macOS's own agents — PortDash won't signal it. Stopping it would switch off part of the system until you log in again.`);
+  }
 }
 
 // ---------------------------------------------------------------- health
@@ -1317,7 +1333,9 @@ function resolveTarget(body) {
     const pid = Number(body.pid);
     if (!Number.isInteger(pid) || pid < 2) throw new Error(`Not a valid pid: ${body.pid}`);
     refuseSelf({ source: pid === process.pid ? 'self' : null });
-    const t = procs(true).byPid[pid];
+    const { byPid } = procs(true);
+    refuseSystemAgent(ownerOf(pid, byPid, launchdJobs()), pid);
+    const t = byPid[pid];
     return { pid, pgid: t ? t.pgid : pid };
   }
   // Fresh: the pid resolved here is about to be signalled, and a pid read from a sample
@@ -2097,13 +2115,30 @@ function projectRow(p){
     +'<div class="acts">'+acts+'</div></div>';
 }
 
+// These rows are other people's programs. The one that earns the section its place is
+// the stray server squatting on the port you wanted — that one you do need to stop. A
+// GUI app you are using, or one of macOS's own agents, is not something anybody means to
+// signal from a port dashboard, and offering it on every row is how a button that
+// freezes the menu bar ends up one click away from a dev server.
+function othersMayStop(o){
+  const k=o.owner&&o.owner.kind;
+  if(k==='app') return false;                       // quit the app; that's what stops it
+  if(k==='launchd'&&o.owner.system) return false;   // and the server refuses these anyway
+  return true;
+}
+
 function otherRow(o){
   const ports=o.ports.map(x=>'<span class="tag port">:'+x+'</span>').join('');
-  let acts='<button data-act="open" data-port="'+o.ports[0]+'">Open</button>'
-    +'<button data-act="'+(o.paused?'resume':'pause')+'" data-pid="'+o.pid+'">'+(o.paused?'Resume':'Pause')+'</button>'
-    +((o.owner&&o.owner.kind==='launchd')
-        ? '<button class="d" data-act="supervised" data-pid="'+o.pid+'">Stop…</button>'
-        : '<button class="d" data-act="stop" data-pid="'+o.pid+'">Stop</button>');
+  let acts='<button data-act="open" data-port="'+o.ports[0]+'">Open</button>';
+  // Resume is offered whatever the row is: it is the way out of a state, never into one.
+  if(o.paused) acts+='<button class="p" data-act="resume" data-pid="'+o.pid+'"'
+    +' title="Unfreeze it and let it carry on.">Resume</button>';
+  // No Pause here at all. For someone else's process the thing you want is to stop it,
+  // and SIGSTOP on an unknown one wedges everything connected to it — freeze a database
+  // and every client waiting on it hangs with no clue why.
+  if(othersMayStop(o)) acts+=(o.owner&&o.owner.kind==='launchd')
+    ? '<button class="d" data-act="supervised" data-pid="'+o.pid+'" title="Something supervises this — see what actually stops it">Stop…</button>'
+    : '<button class="d" data-act="stop" data-pid="'+o.pid+'" title="Stop it and give back its port.">Stop</button>';
   if(o.registrable) acts+='<button data-act="register" data-cwd="'+esc(o.cwd)+'" data-port="'+o.ports[0]+'">Register</button>';
   return '<div class="row"><span class="dot '+(o.paused?'paused':'running')+'"></span><div class="main">'
     +'<div class="nm">'+esc(o.command)+ports
@@ -2383,7 +2418,7 @@ module.exports = {
   etimeToSec, sameProcess, processTable, listeners, sysMem,
   whichIn, envSummary, doctor,
   buildState, procs, ports, invalidate,
-  probe, healthFor, roomierLimit, MIN_LIMIT_MB,
+  probe, healthFor, roomierLimit, MIN_LIMIT_MB, refuseSystemAgent,
   getAlerts: () => alerts,
   resetAlerts: () => { alerts = []; },
   _caches: { rootSeen, sibSaid, health, speaksHttp }
