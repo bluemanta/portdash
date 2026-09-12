@@ -896,18 +896,65 @@ function ownerOf(pid, byPid, jobs) {
   return { kind: 'detached' };
 }
 
+// ---------------------------------------------------------------- sampling
+//
+// Everything the dashboard shows came from shelling out, synchronously, inside the
+// request that asked for it: two lsof calls, a ps and a launchctl per /api/state, per
+// open tab, every 2.5 seconds — while the watchdog independently ran its own ps and
+// vm_stat every 2. The numbers are small (about 170ms of subprocesses per render) but
+// the shape is wrong, and it's the shape that blocks what comes next: a health probe
+// has to wait on a socket, and nothing that waits can happen inside a function whose
+// result is a return value.
+//
+// So sample into a cache and read from it. Two tiers, because they have different
+// customers. The process table and system memory are what the watchdog acts on, so
+// they are taken fresh on every watchdog tick whether or not anyone is watching — a
+// memory guard deciding from a stale reading is the one thing not worth saving a
+// subprocess over. Listening ports, working directories and launchd jobs are only
+// needed to draw a row, so they are taken on demand and reused briefly.
+//
+// Net effect while a dashboard is open: renders land shortly after a watchdog tick and
+// reuse its process table instead of taking their own. Net effect with nothing open:
+// exactly what it was before, which is the state this thing spends most of its life in.
+
+const FRESH_MS = 1500;
+let procSample = null, portSample = null;
+
+/** Process table and system memory. Pass true when a stale answer would be wrong
+    rather than merely late: the watchdog, and anything about to signal a pid. */
+function procs(fresh) {
+  if (!fresh && procSample && Date.now() - procSample.t < FRESH_MS) return procSample;
+  const { byPid, rssByPgid } = processTable();
+  return (procSample = { t: Date.now(), byPid, rssByPgid, sys: sysMem() });
+}
+
+/** Listening sockets, their working directories, and the launchd job table. Only ever
+    needed to render, so nothing takes this on a timer. */
+function ports(fresh) {
+  if (!fresh && portSample && Date.now() - portSample.t < FRESH_MS) return portSample;
+  const L = listeners();
+  return (portSample = {
+    t: Date.now(), L, jobs: launchdJobs(),
+    C: cwdInfo([...new Set(L.map((r) => r.pid))])
+  });
+}
+
+/** The samples describe a process table that no longer exists. */
+function invalidate() { procSample = portSample = null; }
+
 // ---------------------------------------------------------------- state aggregation
 
-function buildState() {
+/** `fresh` forces both samples to be retaken. Rendering doesn't need it — a row that is
+    up to a second and a half behind is invisible next to a 2.5s poll — but anything
+    about to act on a pid does, which is why the callers that signal ask for it. */
+function buildState(fresh) {
   const cfg = getCfg();
   const reg = getReg();
-  const L = listeners();
-  const { byPid, rssByPgid } = processTable();
+  const { byPid, rssByPgid, sys } = procs(fresh);
+  const { L, C, jobs } = ports(fresh);
 
   if (pruneManaged(byPid)) saveManaged();
 
-  const C = cwdInfo([...new Set(L.map((r) => r.pid))]);
-  const jobs = launchdJobs();
   const claimed = new Set();
 
   const projects = reg.map((p) => {
@@ -981,7 +1028,7 @@ function buildState() {
     .map((o) => { o.ports.sort((a, b) => a - b); return o; })
     .sort((a, b) => a.ports[0] - b.ports[0]);
 
-  return { projects, others, alerts, sys: sysMem(), limits: cfg.limits, now: Date.now() };
+  return { projects, others, alerts, sys, limits: cfg.limits, now: Date.now() };
 }
 
 // ---------------------------------------------------------------- process control
@@ -991,8 +1038,11 @@ function signalGroup(pgid, sig) {
   // signal PortDash itself and whatever shell launched it. Nothing below pid 2 is
   // ever a legitimate target either.
   if (!Number.isInteger(pgid) || pgid < 2) return false;
-  try { process.kill(-pgid, sig); return true; } catch (e) { /* fall through */ }
-  try { process.kill(pgid, sig); return true; } catch (e) { return false; }
+  // Whatever the samples say about this process group, it isn't true any more. Doing it
+  // here rather than in each caller also covers the watchdog's own freezes and kills.
+  const sent = () => { invalidate(); return true; };
+  try { process.kill(-pgid, sig); return sent(); } catch (e) { /* fall through */ }
+  try { process.kill(pgid, sig); return sent(); } catch (e) { return false; }
 }
 
 const isSelfProject = (id) => { const p = getReg().find((x) => x.id === id); return !!(p && p.cwd === SELF_DIR); };
@@ -1030,7 +1080,7 @@ function startProject(id) {
   if (starting.has(id)) throw new Error('Already starting, hang on');
 
   // --- Re-check real state right before starting instead of trusting the cache ---
-  const st = buildState();
+  const st = buildState(true);
   const cur = st.projects.find((x) => x.id === id);
   if (cur && cur.pid) throw new Error(`Already running (pid ${cur.pid}) — use "Restart" instead`);
 
@@ -1104,6 +1154,7 @@ function startProject(id) {
   startLog[id].push(now);
   managed[id] = { pid: child.pid, pgid: child.pid, startedAt: now, cmd: p.cmd };
   saveManaged();
+  invalidate();                      // there is a process now that wasn't there a moment ago
   return { pid: child.pid, heapLimitMB: lim.enabled ? heap : null };
 }
 
@@ -1112,10 +1163,12 @@ function resolveTarget(body) {
     const pid = Number(body.pid);
     if (!Number.isInteger(pid) || pid < 2) throw new Error(`Not a valid pid: ${body.pid}`);
     refuseSelf({ source: pid === process.pid ? 'self' : null });
-    const t = processTable().byPid[pid];
+    const t = procs(true).byPid[pid];
     return { pid, pgid: t ? t.pgid : pid };
   }
-  const st = buildState().projects.find((p) => p.id === body.id);
+  // Fresh: the pid resolved here is about to be signalled, and a pid read from a sample
+  // taken a second ago may belong to something else by now.
+  const st = buildState(true).projects.find((p) => p.id === body.id);
   refuseSelf(st);
   if (!st || !st.pid) throw new Error('This project is not currently running');
   return { pid: st.pid, pgid: st.pgid };
@@ -1137,7 +1190,7 @@ const waitGone = (pid, ms) => new Promise((resolve) => {
 });
 
 async function restartProject(id) {
-  const st = buildState().projects.find((p) => p.id === id);
+  const st = buildState(true).projects.find((p) => p.id === id);
   refuseSelf(st);
   if (st && st.pid) {
     signalGroup(st.pgid, 'SIGCONT');
@@ -1157,7 +1210,9 @@ function watchdog() {
   if (!lim.enabled) return;
 
   const reg = getReg();
-  const { byPid, rssByPgid } = processTable();
+  // Always fresh: this is the reading the freeze and kill decisions are made from, and
+  // it is also the sample a render landing in the next second and a half will reuse.
+  const { byPid, rssByPgid, sys: sm } = procs(true);
 
   // Another PortDash that has been up longer and shares this ~/.portdash is already
   // doing this work. Freezing and killing from both would be bad enough; both writing
@@ -1212,7 +1267,6 @@ function watchdog() {
 
   // 3) system-wide pressure → freeze whoever's using the most (only touches processes
   //    PortDash itself started; anything else just gets a warning)
-  const sm = sysMem();
   if (!sm) return;
 
   // Free memory is the signal that actually matters. Swap usage on its own is not:
