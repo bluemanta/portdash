@@ -691,6 +691,80 @@ function pruneManaged(byPid) {
   return dirty;
 }
 
+// ---------------------------------------------------------------- other instances
+//
+// A second PortDash on one machine is not hypothetical: a test run with an isolated
+// HOME, a copy started from a terminal that outlived the terminal, an npx invocation
+// nobody stopped. Each process only ever recognises *itself* (SELF_DIR), so a sibling
+// shows up under "Other processes on listening ports" as an anonymous node row that
+// looks exactly like a dev server — which is how one goes unnoticed for days.
+//
+// Two of them sharing one ~/.portdash is the case that does damage: each holds the
+// managed registry in memory from its own startup and writes the whole object back,
+// so whichever saves last drops the other's records — and a service with no record
+// left has no memory limit any more. Two watchdogs also decide independently what to
+// freeze. So the older process keeps the watchdog and the younger stands down:
+// comparing elapsed time needs no lock file, and both sides reach the same answer.
+//
+// A sibling with its own HOME can't corrupt anything, but it is still running ps and
+// vm_stat every two seconds to supervise nothing, so it gets said out loud once.
+
+/** Is this command line a running PortDash? Matched on the script the interpreter was
+    given rather than on the whole line — "vim portdash.js" is not another instance. */
+function isPortdash(cmdline) {
+  const parts = String(cmdline || '').trim().split(/\s+/);
+  if (!/(^|\/)node$/.test(parts[0] || '')) return false;
+  const script = parts.slice(1).find((a) => a[0] !== '-');
+  return !!script && /(^|\/)portdash\.js$/.test(script);
+}
+
+/** Which ~/.portdash a process is using — the only thing that decides whether a sibling
+    is dangerous or merely wasteful. An unreadable environment (another user, or ps
+    declining) counts as "not ours": standing down on a guess would silently drop the
+    memory protection this program exists to provide. */
+const rootSeen = {};
+function rootOf(pid) {
+  if (!(pid in rootSeen)) {
+    const m = /(?:^|\s)HOME=(\S+)/.exec(run('ps', ['eww', '-p', String(pid)]));
+    rootSeen[pid] = m ? path.join(m[1], '.portdash') : null;
+  }
+  return rootSeen[pid];
+}
+
+function otherInstances(byPid) {
+  for (const k of Object.keys(rootSeen)) if (!byPid[k]) delete rootSeen[k];   // pids get reused
+  const out = [];
+  for (const info of Object.values(byPid)) {
+    if (info.pid === process.pid || !isPortdash(info.command)) continue;
+    out.push({ pid: info.pid, etime: info.etime, root: rootOf(info.pid) });
+  }
+  return out;
+}
+
+const sibSaid = new Set();          // once per process, not once a minute forever
+
+/** The instance that should be supervising instead of this one, if any. Siblings that
+    can't interfere are reported here too, since this is the one place that sees them. */
+function supersededBy(byPid) {
+  const mine = process.uptime();
+  for (const s of otherInstances(byPid)) {
+    if (s.root !== ROOT) {
+      if (!sibSaid.has(s.pid)) {
+        sibSaid.add(s.pid);
+        alert_('warn', `Another PortDash is running (pid ${s.pid}), with its own settings under ${s.root ? shorten(s.root) : 'a home directory this one can\'t read'}. It can't see your projects and isn't supervising anything, but it still scans this machine every two seconds. It's listed below under "Other processes" — stop it there.`,
+               null, 'sib:' + s.pid);
+      }
+      continue;
+    }
+    const theirs = etimeToSec(s.etime);
+    if (theirs === null) continue;
+    // Older wins. Ages within a couple of seconds of each other — both just started —
+    // fall back to the lower pid, so the two never both stand down.
+    if (theirs > mine + 2 || (Math.abs(theirs - mine) <= 2 && s.pid < process.pid)) return s;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- state aggregation
 
 function buildState() {
@@ -753,6 +827,9 @@ function buildState() {
         rssMB: Math.round(rssByPgid[pgid] || info.rssMB || 0),
         cwd, cwdShort: cwd ? shorten(cwd) : '',
         registrable: registrable(cwd),
+        // Without this a sibling is an anonymous "node" row, indistinguishable from a
+        // dev server, and stopping the right one becomes guesswork.
+        portdash: isPortdash(info.command),
         paused: !!(info.stat && info.stat.startsWith('T'))
       };
       otherByPgid.set(pgid, row);
@@ -925,6 +1002,21 @@ function watchdog() {
 
   const reg = getReg();
   const { byPid, rssByPgid } = processTable();
+
+  // Another PortDash that has been up longer and shares this ~/.portdash is already
+  // doing this work. Freezing and killing from both would be bad enough; both writing
+  // state.json from their own startup snapshot is worse, because the loser's services
+  // quietly lose their memory limit. Serve the dashboard, leave the supervising alone.
+  const boss = supersededBy(byPid);
+  if (boss) {
+    if (!sibSaid.has(boss.pid)) {
+      sibSaid.add(boss.pid);
+      alert_('warn', `Another PortDash (pid ${boss.pid}) has been running longer and uses the same ${shorten(ROOT)}, so it keeps the memory watchdog and this one only shows the dashboard. Two of them would fight over the same processes and overwrite each other's records. Stop one.`,
+             null, 'sib:shared:' + boss.pid);
+    }
+    return;
+  }
+
   const running = [];
 
   // Nothing else prunes when running headless — buildState() only executes while a
@@ -1399,6 +1491,7 @@ function otherRow(o){
   if(o.registrable) acts+='<button data-act="register" data-cwd="'+esc(o.cwd)+'" data-port="'+o.ports[0]+'">Register</button>';
   return '<div class="row"><span class="dot '+(o.paused?'paused':'running')+'"></span><div class="main">'
     +'<div class="nm">'+esc(o.command)+ports
+    +(o.portdash?'<span class="tag">another PortDash</span>':'')
     +'<span class="tag">pid '+o.pid+'</span>'+(o.rssMB?'<span class="tag mem">'+gb(o.rssMB)+'</span>':'')+'</div>'
     +'<div class="meta">'+esc(o.cwdShort||o.cmdline||'')+'</div></div>'
     +'<div class="acts">'+acts+'</div></div>';
