@@ -195,6 +195,18 @@ describe('which PortDash keeps the watchdog', () => {
     assert.equal(pd.getAlerts().length, 1);          // once, not once a minute
   });
 
+  it('says nothing about one that has only just appeared', () => {
+    // Every run of this suite starts a PortDash with its own temporary home for a few
+    // seconds, and posting a notice about each one turns the developer's dashboard into
+    // a log of their own test runs. Observed happening, which is how this rule got
+    // written. The row is tagged immediately regardless; only the alert waits for the
+    // thing to prove it is actually sticking around.
+    reset();
+    pd._caches.rootSeen[998] = '/tmp/elsewhere/.portdash';
+    assert.equal(pd.supersededBy({ [process.pid]: me, 998: other(998, '00:08') }), null);
+    assert.equal(pd.getAlerts().length, 0);
+  });
+
   it('treats a home it cannot read as someone else\'s', () => {
     // Standing down on a guess would switch off the memory protection this program
     // exists to provide. Two watchdogs is the safer way to be wrong.

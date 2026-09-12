@@ -803,6 +803,7 @@ function otherInstances(byPid) {
 }
 
 const sibSaid = new Set();          // once per process, not once a minute forever
+const SIBLING_QUIET_SEC = 60;       // how long one has to last before it's worth saying
 
 /** The instance that should be supervising instead of this one, if any. Siblings that
     can't interfere are reported here too, since this is the one place that sees them. */
@@ -810,9 +811,16 @@ function supersededBy(byPid) {
   const mine = process.uptime();
   for (const s of otherInstances(byPid)) {
     if (s.root !== ROOT) {
-      if (!sibSaid.has(s.pid)) {
+      // One that has only just appeared is somebody working — a test run, an npx
+      // invocation, a copy started in a terminal a moment ago — not something stray.
+      // The row below is tagged the instant it shows up either way; only the alert
+      // waits, so running this project's own test suite doesn't post a notice about a
+      // process that will be gone before anyone reads it. An age we can't parse is
+      // treated as too young, because the whole point here is not to cry wolf.
+      const age = etimeToSec(s.etime);
+      if (age !== null && age >= SIBLING_QUIET_SEC && !sibSaid.has(s.pid)) {
         sibSaid.add(s.pid);
-        alert_('warn', `Another PortDash is running (pid ${s.pid}), with its own settings under ${s.root ? shorten(s.root) : 'a home directory this one can\'t read'}. It can't see your projects and isn't supervising anything, but it still scans this machine every two seconds. It's listed below under "Other processes" — stop it there.`,
+        alert_('warn', `Another PortDash has been running for ${s.etime} (pid ${s.pid}), with its own settings under ${s.root ? shorten(s.root) : 'a home directory this one can\'t read'}. It can't see your projects and isn't supervising anything, but it still scans this machine every two seconds. It's listed below under "Other processes" — stop it there.`,
                null, 'sib:' + s.pid);
       }
       continue;
