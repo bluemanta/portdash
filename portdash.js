@@ -508,9 +508,30 @@ function detectProject(dir) {
   if (has('index.html')) {
     // Weak match: a root-level index.html also counts as a previewable static site,
     // but we keep walking below it looking for a "real" sub-project.
-    return { name: path.basename(dir), cmd: 'python3 -m http.server 8000', kind: 'static', weak: true };
+    return { name: path.basename(dir), cmd: staticCmd(8000), kind: 'static', weak: true };
   }
   return null;
+}
+
+const staticCmd = (port) => `python3 -m http.server ${port}`;
+
+/** A port at or above 8000 that nothing in the registry has claimed, either as its
+    recorded port or as one baked into its start command.
+
+    Scanning recognises every static site by the same rule and so generates the same
+    command for all of them. On a machine with ten of them that means ten projects that
+    cannot run at the same time, failing with EADDRINUSE on a command the person never
+    chose and has no reason to suspect. */
+function freeStaticPort(reg) {
+  const taken = new Set();
+  for (const p of reg) {
+    if (p.port) taken.add(+p.port);
+    const m = /\bhttp\.server\s+(\d+)/.exec(p.cmd || '');
+    if (m) taken.add(+m[1]);
+  }
+  let n = 8000;
+  while (taken.has(n)) n++;
+  return n;
 }
 
 function walk(dir, depth, cfg, out) {
@@ -540,15 +561,30 @@ function scanProjects() {
 
   const reg = getReg();
   const known = new Set(reg.map((p) => p.cwd));
+
+  // Entries written by an earlier scan all carry the same static command. Repair the
+  // ones that are still exactly as generated — no recorded port, and a command nobody
+  // has touched — because that is PortDash's own bad guess rather than anyone's choice.
+  // Anything edited is left alone, which is the same promise the loop below keeps.
+  // Two passes. Clearing each stale command only as its own entry is repaired leaves it
+  // claimed by all the entries after it, so 8000 stays occupied until the last one —
+  // and the port everybody expects ends up on whichever project happens to be last.
+  const stale = reg.filter((p) => p.kind === 'static' && !p.port && p.cmd === staticCmd(8000));
+  for (const p of stale) p.cmd = '';
+  for (const p of stale) { p.port = freeStaticPort(reg); p.cmd = staticCmd(p.port); }
+  const repaired = stale.length;
+
   let added = 0;
   for (const f of found) {
     if (known.has(f.cwd)) continue;        // never overwrite an already-registered project (keeps your edits)
-    reg.push({ id: idOf(f.cwd), name: f.name, cwd: f.cwd, cmd: f.cmd, kind: f.kind,
-               port: null, memMB: null, heapMB: null, pinned: false });
+    const port = f.kind === 'static' ? freeStaticPort(reg) : null;
+    reg.push({ id: idOf(f.cwd), name: f.name, cwd: f.cwd,
+               cmd: port ? staticCmd(port) : f.cmd, kind: f.kind,
+               port, memMB: null, heapMB: null, pinned: false });
     added++;
   }
   setReg(reg);
-  return { total: reg.length, added };
+  return { total: reg.length, added, repaired };
 }
 
 // ---------------------------------------------------------------- system inspection
@@ -920,11 +956,13 @@ function buildState() {
     const pgid = info.pgid || r.pid;
     let row = otherByPgid.get(pgid);
     if (!row) {
-      const exe = (info.command || '').trim().split(/\s+/)[0];
       const cwd = C[r.pid] || '';
       row = {
         pid: r.pid, pgid, ports: [],
-        command: exe ? path.basename(exe) : r.command,
+        // procName rather than the basename of the first whitespace-separated token:
+        // half of ~/Library/Application Support is one path with a space in it, and
+        // splitting on whitespace names every one of those processes "Application".
+        command: procName(info.command) || r.command,
         cmdline: info.command || '', etime: info.etime || '',
         rssMB: Math.round(rssByPgid[pgid] || info.rssMB || 0),
         cwd, cwdShort: cwd ? shorten(cwd) : '',
@@ -992,8 +1030,23 @@ function startProject(id) {
   if (starting.has(id)) throw new Error('Already starting, hang on');
 
   // --- Re-check real state right before starting instead of trusting the cache ---
-  const cur = buildState().projects.find((x) => x.id === id);
+  const st = buildState();
+  const cur = st.projects.find((x) => x.id === id);
   if (cur && cur.pid) throw new Error(`Already running (pid ${cur.pid}) — use "Restart" instead`);
+
+  // --- Say who is on the port before letting it fail on the port ---
+  // PortDash can't make a program listen somewhere else, but it does know what is
+  // already there, and finding that out afterwards from an EADDRINUSE in a log is a
+  // worse version of the same answer. The recorded port is a prediction, not a fact,
+  // so the refusal has to say how to overrule it.
+  if (p.port) {
+    const other = st.projects.find((x) => x.id !== id && x.ports.includes(p.port));
+    const proc = other ? null : st.others.find((o) => o.ports.includes(p.port));
+    if (other || proc) {
+      const who = other ? `"${other.name}"` : `${proc.command} (pid ${proc.pid})`;
+      throw new Error(`Port ${p.port} is already taken by ${who}. Stop that first — or if "${p.name}" doesn't actually use port ${p.port}, clear its "Default port" under "Edit".`);
+    }
+  }
 
   // --- Guard against crash-restart loops: a project that keeps failing to start and gets
   //     retried is the classic path to a memory avalanche ---
@@ -1315,8 +1368,12 @@ const server = http.createServer(async (req, res) => {
         const reg = getReg();
         if (reg.some((x) => x.cwd === body.cwd)) throw new Error('This directory is already registered');
         const d = detectProject(body.cwd) || { name: path.basename(body.cwd), cmd: '', kind: 'unknown' };
-        reg.push({ id: idOf(body.cwd), name: d.name, cwd: body.cwd, cmd: d.cmd, kind: d.kind,
-                   port: body.port || null, memMB: null, heapMB: null, pinned: false });
+        // This one is already listening, so its port is a fact rather than a guess — a
+        // generated static command should name that port instead of the generic 8000.
+        const port = body.port || (d.kind === 'static' ? freeStaticPort(reg) : null);
+        reg.push({ id: idOf(body.cwd), name: d.name, cwd: body.cwd, kind: d.kind,
+                   cmd: (d.kind === 'static' && port) ? staticCmd(port) : d.cmd,
+                   port, memMB: null, heapMB: null, pinned: false });
         setReg(reg);
         return json(res, 200, { ok: true });
       }
@@ -1437,6 +1494,11 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     <div><label>Memory limit MB (auto-freeze past this)</label><input id="e_mem" placeholder="leave blank for default"></div>
     <div><label>Node heap limit MB</label><input id="e_heap" placeholder="leave blank for default"></div>
   </div>
+  <div class="sub" style="font-size:12px;margin-top:8px">
+    Default port is the address PortDash opens, pins and checks for conflicts before
+    starting. It does not change what the program listens on — that comes from the start
+    command or the project's own config. Leave it blank if you're not sure.
+  </div>
   <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px">
     <button onclick="edit.close()">Cancel</button>
     <button class="p" onclick="saveEdit()">Save</button>
@@ -1507,7 +1569,12 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;',
 const gb=mb=>mb>=1024?(mb/1024).toFixed(1)+'G':mb+'M';
 
 async function act(p,b){ await api(p,b); setTimeout(load,350); }
-async function scan(){ const r=await api('/api/scan'); toast('Scan complete, '+r.added+' new project(s)'); load(); }
+async function scan(){
+  const r=await api('/api/scan');
+  toast('Scan complete, '+r.added+' new project(s)'
+    +(r.repaired?' · gave '+r.repaired+' static site(s) a port of their own':''));
+  load();
+}
 function open_(port){ window.open('http://localhost:'+port,'_blank'); }
 
 function openEdit(p){
