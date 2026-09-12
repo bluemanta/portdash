@@ -81,6 +81,7 @@ Two things to weigh before doing that:
 - **Pin** the handful you open every day with the ☆ button — they sit in their own section at the top, in the same place whether they're running or not, with a clickable address either way
 - **Logs**: anything PortDash starts gets its output recorded under `~/.portdash/logs/`, viewable right in the UI
 - **Recognizes servers you started yourself** — if you ran a dev server by hand in a terminal, PortDash matches it to the right project by working directory and lets you control it too
+- **Says who owns each service**: the terminal, editor or script it was started from, or the launchd job supervising it. Anything launchd supervises can't be stopped from a dashboard in a way that lasts — it's back a second later — so those rows show you the command that does work (`brew services stop postgresql@16`) instead of a button that appears to do nothing
 - **Starts things in the environment you'd expect**: PortDash reads your own shell's environment at startup, so nvm / Homebrew / Volta / asdf / pyenv installs are visible even when it's running as a background login agent, where the inherited PATH is otherwise almost empty
 - **Says what went wrong**: a service that dies on startup raises an alert that names the cause — missing command, port already taken, dependencies not installed — instead of leaving the reason in a log file
 - **Environment panel**: what PortDash can actually see (shell, node, npm, pnpm, yarn, bun, python3, git, and the full PATH), with a Recheck button. Screenshot it when reporting a problem

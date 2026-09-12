@@ -575,15 +575,17 @@ function listeners() {
   return rows;
 }
 
-/** One pass over the whole process table: pid → info, and pgid → total RSS (MB) */
+/** One pass over the whole process table: pid → info, and pgid → total RSS (MB).
+    ppid is here for ownership: walking up from a listening process is the only way to
+    answer "who started this", and it costs nothing on a pass we already make. */
 function processTable() {
-  const out = run('ps', ['-Ao', 'pid=,pgid=,rss=,stat=,etime=,command=']);
+  const out = run('ps', ['-Ao', 'pid=,ppid=,pgid=,rss=,stat=,etime=,command=']);
   const byPid = {}, rssByPgid = {};
   for (const line of out.split('\n')) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(line);
+    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(line);
     if (!m) continue;
-    const pid = +m[1], pgid = +m[2], rssMB = +m[3] / 1024;
-    byPid[pid] = { pid, pgid, rssMB, stat: m[4], etime: m[5], command: m[6] };
+    const pid = +m[1], ppid = +m[2], pgid = +m[3], rssMB = +m[4] / 1024;
+    byPid[pid] = { pid, ppid, pgid, rssMB, stat: m[5], etime: m[6], command: m[7] };
     rssByPgid[pgid] = (rssByPgid[pgid] || 0) + rssMB;
   }
   return { byPid, rssByPgid };
@@ -765,6 +767,99 @@ function supersededBy(byPid) {
   return null;
 }
 
+// ---------------------------------------------------------------- ownership
+//
+// A Stop that doesn't stick is the most confusing thing a control panel can do, and it
+// is the normal outcome for anything launchd supervises: postgres is back a second
+// later and it looks like PortDash is broken. The dashboard has always known whether
+// *it* started something; what it could never say is who started everything else, so
+// every one of those rows was labelled "external" and left at that.
+//
+// Two cheap sources answer it properly. `launchctl list` maps pid to job label in
+// about five milliseconds, which names the supervisor exactly — homebrew.mxcl.
+// postgresql@16 — and therefore names the command that really stops it. For anything
+// launchd doesn't claim, walking up ppid to the last ancestor before launchd names the
+// terminal, editor or script the process was started from. What's left is genuinely
+// detached: its parent is gone and nothing will bring it back.
+
+/** pid → launchd job label, for jobs in this user's gui domain. Root daemons need a
+    privileged launchctl and simply don't show up here, which is the right failure: this
+    only claims launchd supervision when it can prove it. */
+function launchdJobs() {
+  const map = {};
+  for (const line of run('launchctl', ['list']).split('\n')) {
+    const t = line.split('\t');
+    if (t.length < 3) continue;
+    const pid = parseInt(t[0], 10);        // "-" for a job that isn't currently running
+    if (pid) map[pid] = t[2].trim();
+  }
+  return map;
+}
+
+const INTERPRETER = /^(node|nodejs|python|python3|ruby|perl|sh|bash|zsh|fish|deno|bun)$/;
+
+/** A name worth putting on a row. An app bundle is named by the bundle rather than by
+    the Electron helper buried inside it, and an interpreter is named by the script it
+    is running — "node" on its own tells you nothing about which node. */
+function procName(cmdline) {
+  const app = /\/([^/]+)\.app\//.exec(cmdline || '');
+  if (app) return app[1];
+  const parts = String(cmdline || '').trim().split(/\s+/);
+  const exe = path.basename(parts[0] || '');
+  if (INTERPRETER.test(exe)) {
+    const script = parts.slice(1).find((a) => a[0] !== '-' && /\.\w+$/.test(a));
+    if (script) return path.basename(script);
+  }
+  return exe || 'unknown';
+}
+
+/** Everything above this process up to launchd, nearest first. The seen set is for
+    a ppid cycle, which shouldn't exist but would hang the dashboard if it did. */
+function ancestors(pid, byPid) {
+  const out = [], seen = new Set([pid]);
+  let cur = byPid[pid];
+  while (cur && cur.ppid > 1 && !seen.has(cur.ppid)) {
+    seen.add(cur.ppid);
+    const up = byPid[cur.ppid];
+    if (!up) break;
+    out.push(up);
+    cur = up;
+  }
+  return out;
+}
+
+/** What actually stops a launchd job. Homebrew's wrapper is worth naming separately:
+    it's the command a Homebrew user already has in their fingers, and unlike a bare
+    bootout it also stops the job coming back at the next login. */
+function stopCommand(label) {
+  const brew = /^homebrew\.mxcl\.(.+)$/.exec(label);
+  return brew ? `brew services stop ${brew[1]}` : `launchctl bootout gui/$(id -u)/${label}`;
+}
+
+/** Who is responsible for starting and stopping this process. */
+function ownerOf(pid, byPid, jobs) {
+  const up = ancestors(pid, byPid);
+  for (const p of [pid].concat(up.map((x) => x.pid))) {
+    // Checked before the job lookup, because PortDash is itself a launchd job when it
+    // runs as a login agent: without this, anything it started walks up, matches our own
+    // label, and the dashboard advises stopping PortDash to stop a dev server.
+    if (p === process.pid) return { kind: 'portdash' };
+    const label = jobs[p];
+    if (!label) continue;
+    // A GUI app is a launchd job too, but quitting the app is what stops it and it does
+    // not come back on its own — "launchd will restart this" would be a lie. The same
+    // branch covers a dev server started from an editor's built-in terminal, where the
+    // app is the ancestor rather than the process itself.
+    if (/^application\./.test(label)) return { kind: 'app', label: procName((byPid[p] || {}).command) };
+    // Apple's own agents are listed like anything else and would otherwise be handed a
+    // perfectly correct command for switching off part of the system until next login.
+    return { kind: 'launchd', label, stop: stopCommand(label), system: /^com\.apple\./.test(label) };
+  }
+  const top = up[up.length - 1];
+  if (top) return { kind: 'from', label: procName(top.command), pid: top.pid };
+  return { kind: 'detached' };
+}
+
 // ---------------------------------------------------------------- state aggregation
 
 function buildState() {
@@ -776,6 +871,7 @@ function buildState() {
   if (pruneManaged(byPid)) saveManaged();
 
   const C = cwdInfo([...new Set(L.map((r) => r.pid))]);
+  const jobs = launchdJobs();
   const claimed = new Set();
 
   const projects = reg.map((p) => {
@@ -800,8 +896,14 @@ function buildState() {
       L.forEach((r) => { if (byPid[r.pid] && byPid[r.pid].pgid === pgid) claimed.add(r.pid); });
     }
 
+    // "external" was only ever an admission that PortDash didn't know. Now that it can
+    // find out, say which terminal, editor, script or launchd job it belongs to.
+    const owner = source === 'self' ? { kind: 'self' }
+                : source === 'managed' ? { kind: 'portdash' }
+                : pid ? ownerOf(pid, byPid, jobs) : null;
+
     return Object.assign({}, p, {
-      cwdShort: shorten(p.cwd), status, pid, pgid, ports, etime, source, rssMB,
+      cwdShort: shorten(p.cwd), status, pid, pgid, ports, etime, source, rssMB, owner,
       pinned: !!p.pinned,
       memLimit: p.memMB || cfg.limits.projectRssMB,
       openPort: ports[0] || p.port || null
@@ -827,6 +929,7 @@ function buildState() {
         rssMB: Math.round(rssByPgid[pgid] || info.rssMB || 0),
         cwd, cwdShort: cwd ? shorten(cwd) : '',
         registrable: registrable(cwd),
+        owner: ownerOf(r.pid, byPid, jobs),
         // Without this a sibling is an anonymous "node" row, indistinguishable from a
         // dev server, and stopping the right one becomes guesswork.
         portdash: isPortdash(info.command),
@@ -1274,6 +1377,7 @@ button.star.on:hover{color:var(--pause)}
 .tag.mem{font-family:ui-monospace,Menlo,monospace}
 .tag.mem.warn{color:var(--pause);border-color:color-mix(in srgb,var(--pause) 45%,var(--line))}
 .tag.mem.bad{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,var(--line))}
+.tag.sup{color:var(--pause);border-color:color-mix(in srgb,var(--pause) 45%,var(--line))}
 .acts{display:flex;gap:6px;flex:none;flex-wrap:wrap;justify-content:flex-end}
 .empty{color:var(--dim);padding:22px;text-align:center;border:1px dashed var(--line);border-radius:10px}
 .alert{border-radius:10px;padding:11px 14px;margin-bottom:8px;display:flex;gap:10px;
@@ -1360,9 +1464,30 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
   <div id="d_body">Checking…</div>
 </dialog>
 
+<dialog id="sup">
+  <div style="font-weight:600;margin-bottom:4px">Supervised by launchd</div>
+  <div class="sub" style="font-size:12px" id="s_who"></div>
+  <div class="note">Stopping it from here won't stick</div>
+  <div class="sub" style="font-size:13px;margin-bottom:10px">
+    launchd starts this job again as soon as it exits, so the row turns green a moment later
+    and it looks like nothing happened. Run this in a terminal instead:
+  </div>
+  <pre id="s_cmd" style="max-height:none"></pre>
+  <div class="sub" id="s_sys" hidden style="font-size:13px;margin-top:10px;color:var(--danger)">
+    This is one of macOS's own agents, not a dev server. That command works, but it switches
+    off part of the system until you log in again — it's almost certainly not what you want.
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;margin-top:18px">
+    <button class="d" id="s_anyway">Stop anyway</button>
+    <span class="spacer"></span>
+    <button onclick="copyCmd()">Copy command</button>
+    <button class="p" onclick="sup.close()">Close</button>
+  </div>
+</dialog>
+
 <script>
 const TOKEN='__PORTDASH_TOKEN__';
-const STATE={byId:{}};
+const STATE={byId:{},byPid:{}};
 let editingId=null, logId=null;
 
 const authed=(p)=>fetch(p,{headers:{'X-Portdash-Token':TOKEN}});
@@ -1449,6 +1574,27 @@ function memTag(rss,limit){
     +' <span class="bar"><i class="'+cls+'" style="width:'+w+'%"></i></span></span>';
 }
 
+// Every row says who owns its lifecycle. Nothing is shown for the ordinary case —
+// PortDash started it — because a badge on every single row stops being read.
+function ownerTag(o){
+  if(!o||o.kind==='portdash') return '';
+  if(o.kind==='self')    return '<span class="tag">self</span>';
+  if(o.kind==='launchd') return '<span class="tag sup">launchd · '+esc(o.label)+'</span>';
+  if(o.kind==='app')     return '<span class="tag">'+esc(o.label)+'</span>';
+  if(o.kind==='from')    return '<span class="tag">from '+esc(o.label)+'</span>';
+  return '<span class="tag">detached</span>';
+}
+let supTarget=null;
+function showSup(o,target){
+  supTarget=target; s_who.textContent=o.label; s_cmd.textContent=o.stop;
+  s_sys.hidden=!o.system; sup.showModal();
+}
+async function copyCmd(){
+  try{ await navigator.clipboard.writeText(s_cmd.textContent); toast('Command copied'); }
+  catch(e){ toast('Copy failed — select the text and copy it instead'); }
+}
+s_anyway.onclick=async()=>{ sup.close(); await act('/api/stop',supTarget); };
+
 function pinBtn(p){
   return '<button class="star'+(p.pinned?' on':'')+'" data-act="pin" data-id="'+p.id+'"'
     +' data-pinned="'+(p.pinned?1:0)+'" title="'+(p.pinned?'Unpin':'Pin to the top')+'">'
@@ -1463,16 +1609,19 @@ function projectRow(p){
     ? p.ports.map(x=>'<span class="tag port">:'+x+'</span>').join('')
     : (p.port?'<span class="tag port idle">:'+p.port+'</span>':'');
   const openBtn=p.openPort?'<button data-act="open" data-port="'+p.openPort+'">Open</button>':'';
+  // Something launchd supervises can't be stopped from here in any way that lasts, so
+  // the button opens an explanation and the command that does work.
+  const stopBtn=(p.owner&&p.owner.kind==='launchd')
+    ? btn('supervised',p.id,'Stop…','d') : btn('stop',p.id,'Stop','d');
   let acts='';
   // The self row gets no lifecycle buttons: whatever supervises PortDash owns them.
   if(p.source==='self') acts=openBtn;
   else if(p.status==='stopped') acts=openBtn+btn('start',p.id,'Start','p');
   else if(p.status==='running')
-    acts=openBtn+btn('pause',p.id,'Pause')+btn('restart',p.id,'Restart')+btn('stop',p.id,'Stop','d');
-  else acts=btn('resume',p.id,'Resume','p')+btn('stop',p.id,'Stop','d');
+    acts=openBtn+btn('pause',p.id,'Pause')+btn('restart',p.id,'Restart')+stopBtn;
+  else acts=btn('resume',p.id,'Resume','p')+stopBtn;
   acts+=pinBtn(p)+btn('logs',p.id,'Logs')+btn('edit',p.id,'Edit')+btn('remove',p.id,'×','d');
-  const badge=p.source==='self'?'<span class="tag">self</span>'
-             :p.source==='external'?'<span class="tag">external</span>':'';
+  const badge=ownerTag(p.owner);
   const cmdTxt=p.source==='self'?'serving this dashboard'
              :p.cmd?esc(p.cmd):'<span style="color:var(--pause)">no start command configured</span>';
   const hot=(p.rssMB&&p.memLimit&&p.rssMB/p.memLimit>=.6)?' hot':'';
@@ -1487,11 +1636,13 @@ function otherRow(o){
   const ports=o.ports.map(x=>'<span class="tag port">:'+x+'</span>').join('');
   let acts='<button data-act="open" data-port="'+o.ports[0]+'">Open</button>'
     +'<button data-act="'+(o.paused?'resume':'pause')+'" data-pid="'+o.pid+'">'+(o.paused?'Resume':'Pause')+'</button>'
-    +'<button class="d" data-act="stop" data-pid="'+o.pid+'">Stop</button>';
+    +((o.owner&&o.owner.kind==='launchd')
+        ? '<button class="d" data-act="supervised" data-pid="'+o.pid+'">Stop…</button>'
+        : '<button class="d" data-act="stop" data-pid="'+o.pid+'">Stop</button>');
   if(o.registrable) acts+='<button data-act="register" data-cwd="'+esc(o.cwd)+'" data-port="'+o.ports[0]+'">Register</button>';
   return '<div class="row"><span class="dot '+(o.paused?'paused':'running')+'"></span><div class="main">'
     +'<div class="nm">'+esc(o.command)+ports
-    +(o.portdash?'<span class="tag">another PortDash</span>':'')
+    +(o.portdash?'<span class="tag">another PortDash</span>':'')+ownerTag(o.owner)
     +'<span class="tag">pid '+o.pid+'</span>'+(o.rssMB?'<span class="tag mem">'+gb(o.rssMB)+'</span>':'')+'</div>'
     +'<div class="meta">'+esc(o.cwdShort||o.cmdline||'')+'</div></div>'
     +'<div class="acts">'+acts+'</div></div>';
@@ -1507,6 +1658,11 @@ document.addEventListener('click', async (e)=>{
   if(a==='dismiss')  return act('/api/dismiss',{alertId:b.dataset.alert});
   if(a==='register') return act('/api/register',{cwd:b.dataset.cwd,port:+b.dataset.port});
   if(a==='pin')      return act('/api/pin',{id:id,pinned:b.dataset.pinned!=='1'});
+  if(a==='supervised'){
+    const o=id?STATE.byId[id]:STATE.byPid[pid];
+    if(o&&o.owner) showSup(o.owner, id?{id:id}:{pid:pid});
+    return;
+  }
   if(a==='recheck-env'){
     b.disabled=true; b.textContent='Rechecking…';
     const r=await api('/api/recheck-env');
@@ -1522,6 +1678,7 @@ document.addEventListener('click', async (e)=>{
 async function load(){
   let s; try{ s=await (await authed('/api/state')).json(); }catch(e){ return; }
   STATE.byId={}; s.projects.forEach(p=>STATE.byId[p.id]=p);
+  STATE.byPid={}; s.others.forEach(o=>STATE.byPid[o.pid]=o);
 
   const run=s.projects.filter(p=>p.status==='running').length;
   const pau=s.projects.filter(p=>p.status==='paused').length;
