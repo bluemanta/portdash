@@ -18,7 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execFileSync, spawn } = require('child_process');
+const { execFileSync, execFile, spawn } = require('child_process');
 
 const HOME = os.homedir();
 const ROOT = path.join(HOME, '.portdash');
@@ -136,6 +136,20 @@ function run(cmd, args, opts) {
   } catch (e) {
     return (e && e.stdout) ? e.stdout : '';
   }
+}
+
+/** Same contract as run() — never throws, and an empty string means "it didn't answer"
+    — but off the event loop. Use this for anything a request waits on that isn't
+    bounded by how fast this machine is: a program that hangs instead of answering
+    freezes a single-threaded server for its entire timeout, and there is always one.
+    stdin is closed immediately, so a command that reads it fails rather than waits. */
+function runAsync(cmd, args, opts) {
+  return new Promise((resolve) => {
+    const child = execFile(cmd, args, Object.assign({
+      encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 8000
+    }, opts || {}), (err, stdout) => resolve(stdout || ''));
+    if (child.stdin) child.stdin.end();
+  });
 }
 
 // ---------------------------------------------------------------- environment
@@ -294,22 +308,25 @@ const DOCTOR_TOOLS = ['node', 'npm', 'pnpm', 'yarn', 'bun', 'python3', 'git'];
 
 /** One screen that answers "what can PortDash actually see?" — so a bug report is a
     screenshot instead of twenty questions. */
-function doctor() {
+async function doctor() {
   const e = getEnv();
-  const tools = DOCTOR_TOOLS.map((name) => {
+  // In parallel, and off the event loop. Done synchronously this took nine seconds on
+  // the machine it was written on — one installed tool that answers --version by not
+  // answering burns its whole timeout, and the rest queue up behind it — and every one
+  // of those seconds was the entire dashboard frozen, for someone whose only crime was
+  // opening the panel that exists to explain why things are slow.
+  const tools = await Promise.all(DOCTOR_TOOLS.map(async (name) => {
     const bin = whichIn(e.env, name);
-    let version = null;
-    if (bin) {
-      // Every tool answers --version in its own format ("v24.13.0", "Python 3.9.6",
-      // "git version 2.50.1 (Apple Git-155)") — pull out the number and drop the prose.
-      // Generous timeout: npm's first run on a cold cache can take seconds, and a blank
-      // version next to a tool that is plainly installed reads like a bug.
-      const raw = run(bin, ['--version'], { timeout: 6000, env: e.env }).trim().split('\n')[0] || '';
-      const m = /\d+\.\d+[\w.+-]*/.exec(raw);
-      version = m ? m[0] : (raw.slice(0, 40) || null);
-    }
-    return { name, found: !!bin, path: bin, version };
-  });
+    if (!bin) return { name, found: false, path: null, version: null };
+    // Every tool answers --version in its own format ("v24.13.0", "Python 3.9.6",
+    // "git version 2.50.1 (Apple Git-155)") — pull out the number and drop the prose.
+    // The timeout can stay generous now that waiting costs nothing: npm's first run on
+    // a cold cache takes seconds, and a blank version beside a tool that is plainly
+    // installed reads like a bug.
+    const raw = (await runAsync(bin, ['--version'], { timeout: 6000, env: e.env })).trim().split('\n')[0] || '';
+    const m = /\d+\.\d+[\w.+-]*/.exec(raw);
+    return { name, found: true, path: bin, version: m ? m[0] : (raw.slice(0, 40) || null) };
+  }));
   return {
     ok: e.hasNode,
     via: e.via,
@@ -1352,7 +1369,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/state') return json(res, 200, buildState());
-    if (u.pathname === '/api/doctor') return json(res, 200, doctor());
+    if (u.pathname === '/api/doctor') return json(res, 200, await doctor());
 
     if (u.pathname === '/api/logs') {
       const id = String(u.searchParams.get('id'));
@@ -1866,7 +1883,7 @@ function launchctl(args) {
   } catch (e) { return false; }
 }
 
-function installAgent() {
+async function installAgent() {
   if (!IS_MAC) {
     console.error('--install-agent is macOS-only (it writes a LaunchAgent).');
     console.error('On Linux, write a systemd --user unit that runs: ' + process.execPath + ' ' + __filename);
@@ -1904,7 +1921,7 @@ function installAgent() {
   // and the symptom — Start doing nothing — shows up days later, looking like a bug in
   // PortDash rather than a consequence of this command.
   console.log('');
-  const d = doctor();
+  const d = await doctor();
   console.log(`Checking what PortDash will be able to start your services with:`);
   for (const t of d.tools) {
     if (!t.found && !['node', 'npm'].includes(t.name)) continue;   // only nag about the essentials
@@ -1944,7 +1961,15 @@ if (argv.includes('--version') || argv.includes('-v')) {
   console.log(readJSON(path.join(__dirname, 'package.json'), { version: 'unknown' }).version);
   process.exit(0);
 }
-if (argv.includes('--install-agent')) { installAgent(); process.exit(0); }
+if (argv.includes('--install-agent')) {
+  // installAgent checks the toolchain the same way the dashboard does, which is
+  // asynchronous now, so this branch can't fall through the way the others do: the boot
+  // below would bind a port and start a watchdog on the way out of an install. A
+  // top-level return is how a CommonJS script stops without nesting everything after it.
+  installAgent().then(() => process.exit(0),
+                      (e) => { console.error(String((e && e.message) || e)); process.exit(1); });
+  return;
+}
 if (argv.includes('--uninstall-agent')) { uninstallAgent(); process.exit(0); }
 
 ensure();
