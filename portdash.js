@@ -127,15 +127,212 @@ function getToken() {
   return t;
 }
 
-function run(cmd, args) {
+function run(cmd, args, opts) {
   try {
-    return execFileSync(cmd, args, {
+    return execFileSync(cmd, args, Object.assign({
       encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 8000,
       stdio: ['ignore', 'pipe', 'ignore']
-    });
+    }, opts || {}));
   } catch (e) {
     return (e && e.stdout) ? e.stdout : '';
   }
+}
+
+// ---------------------------------------------------------------- environment
+//
+// Started from a terminal, PortDash inherits whatever that terminal had, and every dev
+// server it launches works. Started at login by launchd (or systemd), it gets a bare
+// PATH of /usr/bin:/bin:/usr/sbin:/sbin — and then `npm run dev` fails with "command
+// not found" for anyone whose node lives in nvm, Homebrew, Volta, asdf or fnm, which is
+// almost everyone. The tools are installed; this process just can't see them.
+//
+// So don't guess where anything lives: ask the user's own shell what it sees, once, at
+// startup. It answers correctly whatever the machine is set up like. Everything below
+// this point is fallback for when it doesn't answer — a shell we don't recognise, a
+// startup file that errors out, a config that hangs. Each layer is worse than the one
+// above but better than nothing, and the last one is exactly today's behaviour, so this
+// can degrade all the way down without making anything worse than it already is.
+
+const ENV_MARK = '__PORTDASH_ENV__';
+
+/** Environment variables the shell reports about *its own* run, which would be wrong or
+    meaningless for a service started later from a different directory. */
+const ENV_DROP = ['PWD', 'OLDPWD', 'SHLVL', '_', 'ENV_MARK'];
+
+/** Directories where the popular version managers and package managers put their
+    binaries. Only used when a shell can't be read — a rough map of where things usually
+    are, for machines whose shell config is broken or unusual. */
+function knownToolDirs() {
+  const dirs = [
+    '/opt/homebrew/bin', '/opt/homebrew/sbin',      // Homebrew, Apple silicon
+    '/usr/local/bin', '/usr/local/sbin',            // Homebrew on Intel, and manual installs
+    '/opt/local/bin',                               // MacPorts
+    path.join(HOME, '.local', 'bin'),
+    path.join(HOME, '.volta', 'bin'),
+    path.join(HOME, '.bun', 'bin'),
+    path.join(HOME, '.deno', 'bin'),
+    path.join(HOME, '.cargo', 'bin'),
+    path.join(HOME, '.asdf', 'shims'),
+    path.join(HOME, '.pyenv', 'shims'),
+    path.join(HOME, '.rbenv', 'shims')
+  ];
+  // nvm and fnm keep one directory per installed version; take the newest.
+  for (const base of [path.join(HOME, '.nvm', 'versions', 'node'),
+                      path.join(HOME, 'Library', 'Application Support', 'fnm', 'node-versions')]) {
+    try {
+      const vs = fs.readdirSync(base).filter((v) => /^v\d/.test(v))
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      if (vs.length) {
+        const bin = path.join(base, vs[vs.length - 1], 'bin');
+        // fnm nests one level deeper than nvm does
+        dirs.unshift(fs.existsSync(bin) ? bin : path.join(base, vs[vs.length - 1], 'installation', 'bin'));
+      }
+    } catch (e) { /* not installed */ }
+  }
+  return dirs.filter((d) => { try { return fs.statSync(d).isDirectory(); } catch (e) { return false; } });
+}
+
+/** Find an executable on a PATH without spawning anything. */
+function whichIn(env, cmd) {
+  for (const dir of String((env && env.PATH) || '').split(':')) {
+    if (!dir) continue;
+    const f = path.join(dir, cmd);
+    try {
+      const st = fs.statSync(f);
+      if (st.isFile() && (st.mode & 0o111)) return f;
+    } catch (e) { /* next */ }
+  }
+  return null;
+}
+
+/** Append the known directories to a PATH, without disturbing the order of what's
+    already there — the user's own choice of node version has to keep winning. */
+function withKnownDirs(env) {
+  const have = String(env.PATH || '').split(':');
+  const extra = knownToolDirs().filter((d) => !have.includes(d));
+  if (!extra.length) return env;
+  return Object.assign({}, env, { PATH: have.concat(extra).filter(Boolean).join(':') });
+}
+
+/**
+ * Ask one shell to print its environment.
+ *
+ * -i matters as much as -l: a login shell reads .zprofile/.zshenv, but nvm, pyenv, asdf
+ * and friends install themselves into .zshrc, which is only read by an *interactive*
+ * shell. Reading just the login files is how this problem hides — the shell starts fine
+ * and reports a PATH, it's simply missing everything the user actually installed.
+ *
+ * The flags are passed separately rather than bundled as "-ilc" because not every shell
+ * parses a bundle. The output is fenced between markers so that a startup file printing
+ * a banner, a version notice or a prompt can't be mistaken for an environment variable.
+ */
+function envFromShell(shellPath) {
+  if (!shellPath) return null;
+  try { if (!fs.statSync(shellPath).isFile()) return null; } catch (e) { return null; }
+  const out = run(shellPath, ['-i', '-l', '-c', `echo ${ENV_MARK}; /usr/bin/env; echo ${ENV_MARK}`],
+                  { timeout: 5000 });
+  const i = out.indexOf(ENV_MARK), j = out.lastIndexOf(ENV_MARK);
+  if (i < 0 || j <= i) return null;
+
+  const env = {};
+  let key = null;
+  for (const line of out.slice(i + ENV_MARK.length, j).split('\n')) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
+    if (m) { key = m[1]; env[key] = m[2]; }
+    else if (key) env[key] += '\n' + line;     // a variable whose value spans lines
+  }
+  if (!env.PATH) return null;
+  for (const k of ENV_DROP) delete env[k];
+  return env;
+}
+
+/** Work down the layers until something usable comes back. Never throws: the worst case
+    returns what this process already had, which is what PortDash used before any of
+    this existed. */
+function resolveEnv() {
+  const t0 = Date.now();
+  const done = (env, via, shell) => ({ env, via, shell: shell || null, ms: Date.now() - t0,
+                                       hasNode: !!whichIn(env, 'node') });
+
+  const shells = [process.env.SHELL, IS_MAC ? '/bin/zsh' : '/bin/bash', '/bin/bash', '/bin/sh']
+    .filter((s, i, a) => s && a.indexOf(s) === i);
+
+  for (const sh of shells) {
+    const env = envFromShell(sh);
+    if (!env) continue;
+    // A shell answered, but its PATH has no node on it — a half-broken startup file, or
+    // a version manager that only activates for a real terminal. Top it up rather than
+    // handing back an environment that is going to fail at the first Start.
+    if (!whichIn(env, 'node')) {
+      const topped = withKnownDirs(env);
+      if (whichIn(topped, 'node')) return done(topped, 'shell+known', sh);
+    }
+    return done(env, 'shell', sh);
+  }
+
+  const patched = withKnownDirs(Object.assign({}, process.env));
+  if (patched.PATH !== process.env.PATH) return done(patched, 'known');
+  return done(Object.assign({}, process.env), 'inherited');
+}
+
+let shellEnv = null;
+const getEnv = () => (shellEnv || (shellEnv = resolveEnv()));
+const refreshEnv = () => (shellEnv = resolveEnv());
+
+function envSummary(e) {
+  const how = { shell: `read from ${path.basename(e.shell || 'shell')}`,
+                'shell+known': `read from ${path.basename(e.shell || 'shell')}, topped up with the usual install locations`,
+                known: 'guessed from the usual install locations (no shell would answer)',
+                inherited: 'inherited from whatever launched PortDash (no shell would answer)' }[e.via];
+  return `Environment: ${how} in ${e.ms}ms — node ${e.hasNode ? 'found' : 'NOT found'}`;
+}
+
+/** The tools a dev server is usually started by. Reported whether or not they're
+    present: "python3 missing" is only alarming if you have a Python project, and the
+    person reading this knows which they have and PortDash doesn't. */
+const DOCTOR_TOOLS = ['node', 'npm', 'pnpm', 'yarn', 'bun', 'python3', 'git'];
+
+/** One screen that answers "what can PortDash actually see?" — so a bug report is a
+    screenshot instead of twenty questions. */
+function doctor() {
+  const e = getEnv();
+  const tools = DOCTOR_TOOLS.map((name) => {
+    const bin = whichIn(e.env, name);
+    let version = null;
+    if (bin) {
+      // Every tool answers --version in its own format ("v24.13.0", "Python 3.9.6",
+      // "git version 2.50.1 (Apple Git-155)") — pull out the number and drop the prose.
+      // Generous timeout: npm's first run on a cold cache can take seconds, and a blank
+      // version next to a tool that is plainly installed reads like a bug.
+      const raw = run(bin, ['--version'], { timeout: 6000, env: e.env }).trim().split('\n')[0] || '';
+      const m = /\d+\.\d+[\w.+-]*/.exec(raw);
+      version = m ? m[0] : (raw.slice(0, 40) || null);
+    }
+    return { name, found: !!bin, path: bin, version };
+  });
+  return {
+    ok: e.hasNode,
+    via: e.via,
+    shell: e.shell,
+    ms: e.ms,
+    summary: envSummary(e),
+    path: String(e.env.PATH || '').split(':').filter(Boolean),
+    tools,
+    // Worth saying before anything breaks: a project tree inside a sync folder produces
+    // read errors that look like random build failures, and nobody connects the two.
+    roots: getCfg().scanRoots.map(expand).map((r) => ({ root: shorten(r), synced: syncedFolder(r) })),
+    portdash: {
+      version: readJSON(path.join(__dirname, 'package.json'), {}).version || 'unknown',
+      script: __filename,
+      uiPort: getCfg().uiPort,
+      agentInstalled: fs.existsSync(F_PLIST),
+      // ppid 1 means whatever started us has already exited or handed us to the init
+      // process — in practice, launchd at login rather than a terminal.
+      startedBy: process.ppid === 1 ? 'login agent / background' : 'terminal',
+      platform: `${process.platform} ${os.release()}`,
+      node: process.version
+    }
+  };
 }
 
 function idOf(cwd) {
@@ -160,12 +357,12 @@ const saveManaged = () => writeJSON(F_STATE, managed);
 
 let alerts = [];
 const alertSeen = {};                 // don't flood with the same alert more than once per 60s
-function alert_(level, text, projectId, key) {
+function alert_(level, text, projectId, key, action) {
   const k = key || (level + ':' + text);
   const now = Date.now();
   if (alertSeen[k] && now - alertSeen[k] < 60000) return;
   alertSeen[k] = now;
-  alerts.unshift({ id: crypto.randomBytes(4).toString('hex'), t: now, level, text, projectId });
+  alerts.unshift({ id: crypto.randomBytes(4).toString('hex'), t: now, level, text, projectId, action });
   alerts = alerts.slice(0, 20);
   logLine(`[${level === 'danger' ? 'action' : 'notice'}] ${text}`);
   if (projectId) {
@@ -174,6 +371,121 @@ function alert_(level, text, projectId, key) {
         `\n***** ${new Date().toLocaleString()}  PortDash: ${text} *****\n`);
     } catch (e) { /* ignore */ }
   }
+}
+
+// ---------------------------------------------------------------- start failures
+//
+// What a dev server prints when it dies on the first second is written for whoever wrote
+// it, not for whoever is trying to use it. "zsh:1: command not found: npm" is a complete
+// explanation if you already know what a PATH is, and a dead end if you don't. Match the
+// handful of ways a start actually fails and say what to do about each; anything that
+// doesn't match falls through to the raw output, which is still better than silence.
+
+/** Name the cloud-sync folder a path sits inside, or null. ~/Desktop and ~/Documents
+    only count when macOS is actually syncing them, which this directory reveals. */
+function syncedFolder(cwd) {
+  if (!cwd) return null;
+  const icloudDesktop = fs.existsSync(path.join(HOME, 'Library', 'Mobile Documents', 'com~apple~CloudDocs', 'Desktop'));
+  const roots = [
+    [path.join(HOME, 'Library', 'Mobile Documents'), 'iCloud Drive'],
+    [path.join(HOME, 'Dropbox'), 'Dropbox'],
+    [path.join(HOME, 'OneDrive'), 'OneDrive'],
+    [path.join(HOME, 'Google Drive'), 'Google Drive'],
+    [path.join(HOME, 'Library', 'CloudStorage'), 'a cloud drive']
+  ];
+  if (icloudDesktop) {
+    roots.push([path.join(HOME, 'Documents'), 'iCloud Drive (your synced Documents folder)']);
+    roots.push([path.join(HOME, 'Desktop'), 'iCloud Drive (your synced Desktop folder)']);
+  }
+  for (const [dir, label] of roots) if (cwd === dir || cwd.startsWith(dir + path.sep)) return label;
+  return null;
+}
+
+/** The last non-empty line, which is where a failing command puts its complaint. */
+function lastLine(text) {
+  const lines = String(text || '').split('\n').map((l) => l.replace(/\[[0-9;]*m/g, '').trim());
+  for (let i = lines.length - 1; i >= 0; i--) if (lines[i] && !lines[i].startsWith('=====')) return lines[i];
+  return '';
+}
+
+/** Which command a shell is complaining about. Every shell words this differently and
+    puts its own name in the line, so match each shape separately rather than with one
+    alternation — a combined pattern happily reports "zsh:1" as the missing command.
+      zsh   zsh:1: command not found: vite
+      bash  bash: line 1: vite: command not found
+      dash  sh: 1: vite: not found            */
+function missingCommand(t) {
+  const pats = [/command not found:\s*(\S+)/i, /([^\s:]+):\s*command not found/i, /([^\s:]+):\s*not found/i];
+  for (const re of pats) {
+    const m = re.exec(t);
+    if (m && m[1]) return m[1].replace(/[.,:;'"]+$/, '');
+  }
+  return null;
+}
+
+function diagnose(output, code, project) {
+  const t = String(output || '');
+  const name = project ? project.name : 'The service';
+
+  const nf = missingCommand(t);
+  if (nf || code === 127) {
+    const cmd = nf || (project && project.cmd || '').split(/\s+/)[0] || 'that command';
+    return {
+      text: `"${name}" couldn't start: ${cmd} isn't on the PATH PortDash is using. That usually means PortDash was launched at login and can't see the tools your terminal can. Recheck the environment, then start it again.`,
+      action: { act: 'recheck-env', label: 'Recheck environment' }
+    };
+  }
+  if (/EADDRINUSE|address already in use|port .*already in use/i.test(t)) {
+    // Only look on the line that complains. A stack trace is full of file:line numbers
+    // that look exactly like ports, and the first one wins if you scan the whole output.
+    const line = t.split('\n').find((l) => /EADDRINUSE|already in use/i.test(l)) || '';
+    const port = (/(?::|\bport\s+)(\d{2,5})(?!\d)/i.exec(line) || [])[1] || (project && project.port) || null;
+    return { text: `"${name}" couldn't start: port ${port || 'it wants'} is already taken. Look under "Other processes on listening ports" below for what's on it, and stop that first.` };
+  }
+  // A read the filesystem refused rather than a program that failed. Almost always a
+  // project living in an iCloud/Dropbox/OneDrive folder: a bundler opens hundreds of
+  // files at once, the sync daemon owns them, and the kernel gives up on the pile-up.
+  // Nothing is broken, and trying again often works — which is exactly why it reads as
+  // a random, unattributable failure until someone names the cause.
+  if (/resource deadlock avoided|Unknown system error -11|EDEADLK|Resource temporarily unavailable/i.test(t)) {
+    const where = project && syncedFolder(project.cwd);
+    return { text: `"${name}" couldn't start: the filesystem refused a read ("resource deadlock avoided"). `
+      + (where ? `This project is inside ${where}, and a folder that syncs to the cloud can't keep up with the thousands of files a build reads at once. Moving the project outside it fixes this for good. `
+               : `This usually happens when a project sits in a cloud-synced folder (iCloud Drive, Dropbox, OneDrive). `)
+      + `It's intermittent — starting it again will often just work.` };
+  }
+  // Match on whole words: "node_modules" followed loosely by "not" also matches the
+  // "not" inside "Cannot", which turns any error mentioning a path under node_modules
+  // into a confident, wrong "your dependencies aren't installed".
+  if (/ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|Cannot find module|Cannot find package|node_modules[^\n]*\bnot found\b/i.test(t)) {
+    return { text: `"${name}" couldn't start: its dependencies aren't installed. Open a terminal in the project folder and run the install command for it (npm install, pnpm install, yarn) once, then try again.` };
+  }
+  if (/Missing script|npm ERR! Missing script|Unknown command|command ".*" not found/i.test(t)) {
+    return { text: `"${name}" couldn't start: "${(project && project.cmd) || 'the start command'}" isn't something this project knows how to run. Click "Edit" and set the command you'd type yourself.` };
+  }
+  if (/no such file or directory|ENOENT/i.test(t)) {
+    return { text: `"${name}" couldn't start: something it needs isn't where it expected. Check "Logs" for the full output — the missing path is named there.` };
+  }
+  const tail = lastLine(t);
+  return { text: `"${name}" started and exited immediately${code === null || code === undefined ? '' : ` (exit code ${code})`}.` + (tail ? ` It said: ${tail.slice(0, 200)}` : ' It printed nothing — check "Logs".') };
+}
+
+/** Read what was appended to a log after `from`, capped at `max` bytes.
+    Diagnosing from the tail of the whole file instead would read whatever the *previous*
+    run left there — a start that fails on a busy port gets reported as the missing
+    command from an hour ago, which is worse than saying nothing. */
+function logSlice(file, from, max) {
+  try {
+    const size = fs.statSync(file).size;
+    const start = Math.min(Math.max(from, 0), size);
+    const len = Math.min(size - start, max);
+    if (len <= 0) return '';
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    fs.closeSync(fd);
+    return buf.toString('utf8');
+  } catch (e) { return ''; }
 }
 
 // ---------------------------------------------------------------- project scanning
@@ -522,9 +834,13 @@ function startProject(id) {
   rotateLog(logFile, lim.logMaxMB);
   const fd = fs.openSync(logFile, 'a');
   fs.writeSync(fd, `\n===== ${new Date().toLocaleString()}  start: ${p.cmd} =====\n`);
+  // Where this run's output begins, so a failure is diagnosed from what *it* printed.
+  let logFrom = 0;
+  try { logFrom = fs.fstatSync(fd).size; } catch (e) { /* diagnose from the whole tail */ }
 
-  // --- Cap node's heap so it OOMs itself instead of taking the whole system down ---
-  const env = Object.assign({}, process.env, { FORCE_COLOR: '0' });
+  // --- Run it in the environment the user's own terminal would give it, not the one
+  //     launchd gave us (see resolveEnv) ---
+  const env = Object.assign({}, getEnv().env, { FORCE_COLOR: '0' });
   const heap = p.heapMB || lim.nodeHeapMB;
   if (lim.enabled && heap && !/max-old-space-size/.test(env.NODE_OPTIONS || '')) {
     env.NODE_OPTIONS = ((env.NODE_OPTIONS || '') + ` --max-old-space-size=${heap}`).trim();
@@ -536,7 +852,18 @@ function startProject(id) {
     stdio: ['ignore', fd, fd],
     env
   });
-  child.unref();
+  // A start that fails does so within the first second, and until now it did it silently:
+  // the row went back to "stopped" and the reason sat in a log file nobody thought to
+  // open. Watch just long enough to catch that, and turn whatever it printed into an
+  // alert. Anything still alive after this window is a real start and is left alone.
+  child.on('exit', (code) => {
+    if (Date.now() - now > 4000) return;
+    const d = diagnose(logSlice(logFile, logFrom, 8192), code, p);
+    if (managed[id] && managed[id].pid === child.pid) { delete managed[id]; saveManaged(); }
+    alert_('danger', d.text, id, 'exit:' + id, d.action);
+  });
+  child.unref();                     // unref only stops the child holding the event loop
+                                     // open; the exit listener above still fires
   fs.closeSync(fd);                  // the child holds its own dup; keeping ours leaks one fd per start
 
   starting.add(id);
@@ -723,6 +1050,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/state') return json(res, 200, buildState());
+    if (u.pathname === '/api/doctor') return json(res, 200, doctor());
 
     if (u.pathname === '/api/logs') {
       const id = String(u.searchParams.get('id'));
@@ -753,6 +1081,11 @@ const server = http.createServer(async (req, res) => {
       if (u.pathname === '/api/pause')   return json(res, 200, { ok: signalGroup(resolveTarget(body).pgid, 'SIGSTOP') });
       if (u.pathname === '/api/resume')  return json(res, 200, { ok: signalGroup(resolveTarget(body).pgid, 'SIGCONT') });
       if (u.pathname === '/api/dismiss') { alerts = alerts.filter((a) => a.id !== body.alertId); return json(res, 200, { ok: true }); }
+      if (u.pathname === '/api/recheck-env') {
+        const e = refreshEnv();
+        logLine('Rechecked. ' + envSummary(e));
+        return json(res, 200, { ok: true, hasNode: e.hasNode, summary: envSummary(e) });
+      }
 
       if (u.pathname === '/api/save') {
         const reg = getReg();
@@ -867,6 +1200,14 @@ input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px
 .two{display:flex;gap:12px}.two>div{flex:1}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;max-height:56vh;
   overflow:auto;font:12px/1.6 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all}
+.alert .go{margin-left:auto;flex:none;align-self:center}
+.chk{display:flex;align-items:baseline;gap:9px;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+.chk:last-child{border-bottom:0}
+.chk .k{width:82px;flex:none;color:var(--dim);font-size:12px}
+.chk .v{font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chk .no{color:var(--dim)}
+.ok{color:var(--run)} .bad{color:var(--danger)}
+.note{font-size:12px;color:var(--dim);margin:14px 0 4px;font-weight:600}
 .err{background:var(--danger);color:#fff;padding:9px 14px;border-radius:8px;position:fixed;bottom:20px;
   left:50%;transform:translateX(-50%);z-index:9;box-shadow:0 4px 16px rgba(0,0,0,.2);max-width:80vw}
 </style></head><body>
@@ -876,6 +1217,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     <span class="sub" id="stat">Loading…</span>
     <span class="spacer"></span>
     <span class="sub" id="sys"></span>
+    <button onclick="showDoctor()">Environment</button>
     <button onclick="scan()">Rescan</button>
   </header>
   <div id="alerts"></div>
@@ -911,6 +1253,19 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     <button onclick="logs.close()">Close</button>
   </div>
   <pre id="l_body"></pre>
+</dialog>
+
+<dialog id="doc">
+  <div style="display:flex;align-items:center;margin-bottom:4px">
+    <div style="font-weight:600">Environment</div><span class="spacer"></span>
+    <button onclick="recheckEnv()">Recheck</button>
+    <button onclick="doc.close()" style="margin-left:6px">Close</button>
+  </div>
+  <div class="sub" style="font-size:12px;margin-bottom:14px">
+    What PortDash can see when it starts your services. If something here is missing, that's
+    why a service won't start — screenshot this when reporting a problem.
+  </div>
+  <div id="d_body">Checking…</div>
 </dialog>
 
 <script>
@@ -953,6 +1308,38 @@ async function showLogs(p){
   l_body.textContent=await (await authed('/api/logs?id='+encodeURIComponent(p.id))).text();
   l_body.scrollTop=l_body.scrollHeight;
 }
+async function showDoctor(){
+  d_body.textContent='Checking…'; doc.showModal(); renderDoctor();
+}
+async function renderDoctor(){
+  let d; try{ d=await (await authed('/api/doctor')).json(); }catch(e){ d_body.textContent='Could not read the environment.'; return; }
+  const row=(k,v,cls)=>'<div class="chk"><span class="k">'+k+'</span><span class="v '+(cls||'')+'">'+v+'</span></div>';
+  const tool=t=>row(t.name, t.found
+      ? '<span class="ok">✓</span> '+esc(t.version||'installed')+' <span class="no">· '+esc(t.path)+'</span>'
+      : '<span class="no">not found</span>');
+  d_body.innerHTML=
+     '<div class="chk"><span class="k">Status</span><span class="v '+(d.ok?'ok':'bad')+'">'
+       +(d.ok?'✓ Node.js is visible — services should start':'✗ Node.js is NOT visible — Node projects will fail to start')+'</span></div>'
+    +row('How', esc(d.summary.replace(/^Environment: /,'')))
+    +(d.roots||[]).filter(r=>r.synced).map(r=>row('Storage',
+        '<span class="bad">'+esc(r.root)+' is in '+esc(r.synced)+'</span>'
+        +'<div class="no" style="white-space:normal;font-family:inherit;margin-top:3px">Cloud-synced folders struggle with the thousands of small files in node_modules — builds there fail with read errors that look random. Moving your projects out of it avoids that.</div>')).join('')
+    +'<div class="note">Tools</div>'+d.tools.map(tool).join('')
+    +'<div class="note">PortDash</div>'
+    +row('Version', esc(d.portdash.version))
+    +row('Started by', esc(d.portdash.startedBy)+(d.portdash.agentInstalled?' · login agent installed':''))
+    +row('Script', esc(d.portdash.script))
+    +row('Node', esc(d.portdash.node)+' · '+esc(d.portdash.platform))
+    +'<div class="note">PATH ('+d.path.length+' entries)</div>'
+    +'<pre style="max-height:22vh">'+d.path.map(esc).join('\\n')+'</pre>';
+}
+async function recheckEnv(){
+  d_body.textContent='Rechecking…';
+  const r=await api('/api/recheck-env');
+  toast(r.hasNode?'Environment rechecked — Node.js found':'Environment rechecked — still no Node.js');
+  renderDoctor(); load();
+}
+
 async function remove(p){
   if(!confirm('Remove "'+p.name+'" from the registry? (this won\\'t touch your project files)'))return;
   await act('/api/remove',{id:p.id});
@@ -1027,6 +1414,14 @@ document.addEventListener('click', async (e)=>{
   if(a==='dismiss')  return act('/api/dismiss',{alertId:b.dataset.alert});
   if(a==='register') return act('/api/register',{cwd:b.dataset.cwd,port:+b.dataset.port});
   if(a==='pin')      return act('/api/pin',{id:id,pinned:b.dataset.pinned!=='1'});
+  if(a==='recheck-env'){
+    b.disabled=true; b.textContent='Rechecking…';
+    const r=await api('/api/recheck-env');
+    toast(r.hasNode?'Environment rechecked — Node.js found. Try starting it again.'
+                   :'Environment rechecked — still no Node.js. Open "Environment" for details.');
+    if(r.hasNode) await api('/api/dismiss',{alertId:b.dataset.alert});
+    return load();
+  }
   const M={start:'/api/start',stop:'/api/stop',pause:'/api/pause',resume:'/api/resume',restart:'/api/restart'};
   if(M[a]) return act(M[a], id?{id:id}:{pid:pid});
 });
@@ -1047,6 +1442,7 @@ async function load(){
   }
 
   alerts.innerHTML=(s.alerts||[]).map(a=>'<div class="alert '+a.level+'"><div>'+esc(a.text)+'</div>'
+    +(a.action?'<button class="go" data-act="'+esc(a.action.act)+'" data-alert="'+a.id+'">'+esc(a.action.label)+'</button>':'')
     +'<button class="x" data-act="dismiss" data-alert="'+a.id+'">×</button></div>').join('');
 
   // Pinned rows keep the same place whatever they are doing — sorting them by status
@@ -1131,6 +1527,25 @@ function installAgent() {
   console.log(`  plist:  ${F_PLIST}`);
   console.log(`  log:    ${F_SELFLOG}`);
   console.log(`  remove: portdash --uninstall-agent`);
+
+  // Check now, while the person is still here and remembers doing this. Running at login
+  // is exactly the case where PortDash stops seeing the tools a terminal would give it,
+  // and the symptom — Start doing nothing — shows up days later, looking like a bug in
+  // PortDash rather than a consequence of this command.
+  console.log('');
+  const d = doctor();
+  console.log(`Checking what PortDash will be able to start your services with:`);
+  for (const t of d.tools) {
+    if (!t.found && !['node', 'npm'].includes(t.name)) continue;   // only nag about the essentials
+    console.log(`  ${t.found ? '✓' : '✗'} ${t.name.padEnd(8)} ${t.found ? (t.version || '') + '  ' + t.path : 'not found'}`);
+  }
+  console.log(`  (${d.summary.replace(/^Environment: /, '')})`);
+  if (!d.ok) {
+    console.log('');
+    console.log(`WARNING: PortDash can't see Node.js, so starting Node projects will fail with`);
+    console.log(`"command not found". Open the dashboard, click "Environment", and use "Recheck"`);
+    console.log(`after fixing your shell setup — or start PortDash from a terminal instead.`);
+  }
 }
 
 function uninstallAgent() {
@@ -1177,6 +1592,12 @@ server.listen(cfg0.uiPort, '127.0.0.1', () => {
 
   const sm = sysMem();
   logLine(`PortDash → http://localhost:${cfg0.uiPort}`);
+  const e = getEnv();
+  logLine(`  ${envSummary(e)}`);
+  if (!e.hasNode) {
+    alert_('warn', "PortDash can't find Node.js in the environment it would start services with, so Node projects will fail to start. Open \"Environment\" to see what it can see.",
+           null, 'env:nonode', { act: 'recheck-env', label: 'Recheck environment' });
+  }
   logLine(`  Memory protection: ${cfg0.limits.enabled ? 'on' : 'off'}` +
     (cfg0.limits.enabled
       ? ` (freeze at ${cfg0.limits.projectRssMB}M / kill at ${cfg0.limits.hardRssMB}M per project, node heap ${cfg0.limits.nodeHeapMB}M)`
