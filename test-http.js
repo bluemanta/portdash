@@ -338,6 +338,32 @@ describe('a running PortDash', () => {
     assert.equal(ico.code, 204, 'browsers that ask for .ico anyway should get nothing, not a 404');
   });
 
+  it('refuses to restart something it has no way to start again, without stopping it', async () => {
+    // Restart is stop-then-start, and the start is the half that fails. Before the guard
+    // this stopped the service and handed back an error: the button took the thing away.
+    // So the assertion that matters is not the 400, it's that the service survived it.
+    await start('fixture-app');
+    await until('fixture-app', (x) => x.ports.includes(APP));
+
+    const reg = registry();                        // the registry is read from disk per call
+    reg.find((p) => p.id === 'fixture-app').cmd = '';
+    setRegistry(reg);
+
+    const r = await post('/api/restart', { id: 'fixture-app' });
+    assert.equal(r.code, 400);
+    assert.match(JSON.parse(r.body).error, /no start command/);
+
+    const survived = await row('fixture-app');
+    assert.equal(survived.status, 'running', 'the refusal must not have stopped it');
+    assert.ok(survived.ports.includes(APP), 'and it should still be listening');
+
+    reg.find((p) => p.id === 'fixture-app').cmd = 'node server.js';
+    setRegistry(reg);
+    assert.equal((await post('/api/stop', { id: 'fixture-app' })).code, 200);
+    await until('fixture-app', (x) => x.status === 'stopped');
+    started.length = 0;
+  });
+
   it('ships a page whose script and markup agree', async () => {
     // The browser code is a string inside this file and nothing type-checks it. A
     // renamed dialog or a typo in an element id throws on page load, and every test
@@ -351,5 +377,15 @@ describe('a running PortDash', () => {
 
     const dialogs = [...page.matchAll(/<dialog id="(\w+)"/g)].map((m) => m[1]);
     assert.equal(dialogs.length, new Set(dialogs).size, 'duplicate dialog id');
+
+    // The icon buttons are the only controls on the page with no text in them. A screen
+    // reader has nothing else to go on, so their generators have to keep saying what
+    // they are — easy to drop while rearranging markup, and invisible when you do.
+    for (const fn of ['iconBtn', 'pinBtn']) {
+      const body = new RegExp('function ' + fn + '[\\s\\S]{0,500}?\\}').exec(script);
+      assert.ok(body, fn + ' should still exist');
+      assert.match(body[0], /aria-label=/, fn + ' should give its button a name');
+      assert.match(body[0], /title=/, fn + ' should give its button a tooltip');
+    }
   });
 });

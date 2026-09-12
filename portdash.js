@@ -1340,8 +1340,25 @@ const waitGone = (pid, ms) => new Promise((resolve) => {
 });
 
 async function restartProject(id) {
-  const st = buildState(true).projects.find((p) => p.id === id);
+  const p = getReg().find((x) => x.id === id);
+  if (!p) throw new Error('Project not found');
+
+  // Checked before anything is stopped, because restart is stop-then-start and the
+  // start is the half that fails. Without this, pressing Restart on a project with no
+  // start command stops the service and then reports that it can't be started — the
+  // button takes the thing away and hands back an error.
+  if (!p.cmd) {
+    throw new Error(`"${p.name}" has no start command, so it can't be restarted — it would be stopped and not come back. Click "Edit" and set one, or use "Stop" if that's what you meant.`);
+  }
+
+  const st = buildState(true).projects.find((x) => x.id === id);
   refuseSelf(st);
+
+  // Stopping something launchd supervises doesn't stop it; it comes straight back, and
+  // then this would start a second copy alongside it.
+  if (st && st.owner && st.owner.kind === 'launchd') {
+    throw new Error(`"${p.name}" is supervised by launchd as ${st.owner.label}, so restarting it here would stop it, let launchd bring it back, and then start a second copy on top. Run: ${st.owner.stop}`);
+  }
   if (st && st.pid) {
     signalGroup(st.pgid, 'SIGCONT');
     signalGroup(st.pgid, 'SIGTERM');
@@ -1656,9 +1673,17 @@ h2{font-size:13px;color:var(--dim);font-weight:600;margin:26px 0 10px;letter-spa
 .row{background:var(--card);border:1px solid var(--line);border-radius:10px;
   padding:13px 15px;margin-bottom:8px;display:flex;align-items:center;gap:13px}
 .row.hot{border-color:color-mix(in srgb,var(--pause) 55%,var(--line))}
-button.star{padding:5px 8px;line-height:1}
-button.star.on{color:var(--pause);border-color:color-mix(in srgb,var(--pause) 45%,var(--line))}
-button.star.on:hover{color:var(--pause)}
+/* The four housekeeping actions repeat on every row with identical labels, so after the
+   first row nobody reads them — they are texture. Borderless, dim and iconic, they drop
+   out of the way until wanted, and the lifecycle buttons beside them stop competing
+   with four words that never change. */
+button.icon{padding:5px 6px;line-height:0;border-color:transparent;background:none;color:var(--dim)}
+button.icon:hover{color:var(--accent);border-color:var(--line)}
+button.icon.on{color:var(--pause)}
+button.icon.on:hover{color:var(--pause);border-color:color-mix(in srgb,var(--pause) 45%,var(--line))}
+button.icon.d:hover{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 40%,var(--line))}
+button.icon svg{display:block;width:15px;height:15px}
+.acts .sep{flex:none;width:1px;align-self:stretch;margin:3px 4px;background:var(--line)}
 .dot{width:8px;height:8px;border-radius:50%;flex:none}
 .dot.running{background:var(--run);box-shadow:0 0 0 3px color-mix(in srgb,var(--run) 22%,transparent)}
 .dot.paused{background:var(--pause);box-shadow:0 0 0 3px color-mix(in srgb,var(--pause) 22%,transparent)}
@@ -1907,10 +1932,38 @@ async function copyCmd(){
 }
 s_anyway.onclick=async()=>{ sup.close(); await act('/api/stop',supTarget); };
 
+// Hand-drawn rather than a font or a sprite sheet, because the whole program is one file
+// with nothing to install. Stroked on currentColor so each one inherits whatever state
+// its button is in. The star is the exception: filled means pinned, which is the state
+// itself rather than a decoration.
+//
+// Remove is an ✕ and not a wastebasket on purpose. It takes the project out of
+// PortDash's list; it does not touch a single file on disk, and a bin would promise
+// that it does.
+const SVG=(inner)=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
+  +' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+inner+'</svg>';
+const STAR_D='M12 3.2l2.7 5.5 6 .9-4.3 4.2 1 6-5.4-2.8-5.4 2.8 1-6L3.3 9.6l6-.9z';
+const ICON={
+  star:   SVG('<path d="'+STAR_D+'"/>'),
+  starOn: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="'+STAR_D+'"/></svg>',
+  // A terminal, not a page of paper: what "Logs" opens is a program's output.
+  logs:   SVG('<rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M7.6 10.2l2.4 1.9-2.4 1.9"/><path d="M12.8 14.4h3.6"/>'),
+  edit:   SVG('<path d="M4 20.2l.7-3.6L16.1 5.2a2 2 0 0 1 2.8 2.8L7.5 19.5z"/><path d="M14.4 6.9l2.7 2.7"/>'),
+  remove: SVG('<path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/>')
+};
+
+function iconBtn(a,id,icon,title,cls){
+  // title for the pointer, aria-label for everything else: an icon on its own says
+  // nothing to a screen reader, and these four are the only unlabelled controls here.
+  return '<button class="icon '+(cls||'')+'" data-act="'+a+'" data-id="'+id+'"'
+    +' title="'+esc(title)+'" aria-label="'+esc(title)+'">'+icon+'</button>';
+}
+
 function pinBtn(p){
-  return '<button class="star'+(p.pinned?' on':'')+'" data-act="pin" data-id="'+p.id+'"'
-    +' data-pinned="'+(p.pinned?1:0)+'" title="'+(p.pinned?'Unpin':'Pin to the top')+'">'
-    +(p.pinned?'★':'☆')+'</button>';
+  const t=p.pinned?'Unpin':'Pin to the top';
+  return '<button class="icon'+(p.pinned?' on':'')+'" data-act="pin" data-id="'+p.id+'"'
+    +' data-pinned="'+(p.pinned?1:0)+'" title="'+t+'" aria-label="'+t+'">'
+    +(p.pinned?ICON.starOn:ICON.star)+'</button>';
 }
 
 // "running" answers whether a process exists. What you want to know is whether the
@@ -1944,14 +1997,25 @@ function projectRow(p){
   // the button opens an explanation and the command that does work.
   const stopBtn=(p.owner&&p.owner.kind==='launchd')
     ? btn('supervised',p.id,'Stop…','d') : btn('stop',p.id,'Stop','d');
+  // Restart is stop-then-start, so it is only an offer PortDash can keep when it knows
+  // how to start the thing and nothing else is going to beat it to it. On a launchd job
+  // it would stop the service, watch launchd bring it back, and start a second copy; on
+  // a project with no start command it would stop the service and fail. The server
+  // refuses both, and a button that can only produce an error shouldn't be there at all.
+  const canRestart=!!p.cmd && !(p.owner&&p.owner.kind==='launchd');
   let acts='';
   // The self row gets no lifecycle buttons: whatever supervises PortDash owns them.
   if(p.source==='self') acts=openBtn;
+  // Start stays even with no command configured: it answers with what to do about that,
+  // and the row already says so in orange. Hiding it would leave no way forward.
   else if(p.status==='stopped') acts=openBtn+btn('start',p.id,'Start','p');
   else if(p.status==='running')
-    acts=openBtn+btn('pause',p.id,'Pause')+btn('restart',p.id,'Restart')+stopBtn;
+    acts=openBtn+btn('pause',p.id,'Pause')+(canRestart?btn('restart',p.id,'Restart'):'')+stopBtn;
   else acts=btn('resume',p.id,'Resume','p')+stopBtn;
-  acts+=pinBtn(p)+btn('logs',p.id,'Logs')+btn('edit',p.id,'Edit')+btn('remove',p.id,'×','d');
+  acts+='<span class="sep"></span>'+pinBtn(p)
+    +iconBtn('logs',p.id,ICON.logs,'Logs')
+    +iconBtn('edit',p.id,ICON.edit,'Edit')
+    +iconBtn('remove',p.id,ICON.remove,'Remove from PortDash','d');
   const badge=ownerTag(p.owner);
   const cmdTxt=p.source==='self'?'serving this dashboard'
              :p.cmd?esc(p.cmd):'<span style="color:var(--pause)">no start command configured</span>';
