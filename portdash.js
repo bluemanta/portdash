@@ -1362,6 +1362,17 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end(b);
     }
+    // Unauthenticated on purpose, like the page itself: a browser fetches this from the
+    // <link> in the markup, as a plain request carrying nothing we could check. It is a
+    // fixed drawing and says nothing about this machine.
+    if (u.pathname === '/favicon.svg') {
+      const b = Buffer.from(SVG_ICON);
+      res.writeHead(200, {
+        'Content-Type': 'image/svg+xml; charset=utf-8', 'Content-Length': b.length,
+        'Cache-Control': 'public, max-age=3600'
+      });
+      return res.end(b);
+    }
     if (u.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
 
     if (u.pathname.startsWith('/api/') && !isTrustedRequest(req, u)) {
@@ -1462,10 +1473,34 @@ const server = http.createServer(async (req, res) => {
 
 // ---------------------------------------------------------------- frontend
 
+/**
+ * The tab icon: three rows, each a status dot beside a service, which is what the
+ * dashboard underneath it actually looks like. The three colours are the three words
+ * this program uses — running, frozen, stopped — so the icon says what it is rather
+ * than being a logo that has to be learned.
+ *
+ * Drawn on a dark tile rather than as a bare glyph: a favicon has no idea what colour
+ * the toolbar behind it is, and a shape that relies on contrast with the background
+ * disappears in one theme or the other. The tile brings its own background.
+ *
+ * SVG rather than a .ico, because a .ico is binary and this program is one readable
+ * file. Browsers that ask for /favicon.ico anyway get the 204 below.
+ */
+const SVG_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="7" fill="#1b1e23"/>
+  <circle cx="9" cy="8.5" r="2.8" fill="#10b981"/>
+  <rect x="14.5" y="6.9" width="11" height="3.2" rx="1.6" fill="#e8eaed" opacity=".92"/>
+  <circle cx="9" cy="16" r="2.8" fill="#f59e0b"/>
+  <rect x="14.5" y="14.4" width="8.5" height="3.2" rx="1.6" fill="#e8eaed" opacity=".6"/>
+  <circle cx="9" cy="23.5" r="2.8" fill="#6b7280"/>
+  <rect x="14.5" y="21.9" width="9.8" height="3.2" rx="1.6" fill="#e8eaed" opacity=".34"/>
+</svg>`;
+
 const HTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PortDash</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
 :root{--bg:#f6f7f9;--card:#fff;--line:#e4e7ec;--tx:#1a1d21;--dim:#6b7280;
   --run:#10b981;--pause:#f59e0b;--stop:#9ca3af;--accent:#2563eb;--danger:#dc2626}

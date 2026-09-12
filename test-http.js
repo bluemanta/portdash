@@ -253,6 +253,23 @@ describe('a running PortDash', () => {
     started.length = 0;
   });
 
+  it('serves a tab icon, without a token, to a page that asks for it', async () => {
+    // A browser fetches this straight from the <link>, before any of our script has run,
+    // so it carries no token. Behind the token check it would be a silently broken icon.
+    assert.match((await get('/')).body, /<link rel="icon" href="\/favicon\.svg"/);
+
+    const real = TOKEN;
+    TOKEN = null;
+    const icon = await get('/favicon.svg');
+    const ico = await get('/favicon.ico');
+    TOKEN = real;
+
+    assert.equal(icon.code, 200);
+    assert.match(icon.body, /^<svg /);
+    assert.match(icon.body, /viewBox="0 0 32 32"/);
+    assert.equal(ico.code, 204, 'browsers that ask for .ico anyway should get nothing, not a 404');
+  });
+
   it('ships a page whose script and markup agree', async () => {
     // The browser code is a string inside this file and nothing type-checks it. A
     // renamed dialog or a typo in an element id throws on page load, and every test
