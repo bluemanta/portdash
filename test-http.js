@@ -33,7 +33,7 @@ const path = require('path');
 
 let child = null;         // the PortDash under test
 let started = [];         // pgids of anything the tests asked it to start
-let UI = 0, APP = 0, TCPP = 0, WEDGE = 0, TOKEN = '', HOME = '', boot = '';
+let UI = 0, APP = 0, TCPP = 0, WEDGE = 0, LINK = 0, TOKEN = '', HOME = '', boot = '';
 
 /** Nothing survives this file, however it ends — a thrown assertion, a crash, ^C. */
 function cleanup() {
@@ -153,6 +153,7 @@ describe('a running PortDash', () => {
     APP = await freePort();
     TCPP = await freePort();
     WEDGE = await freePort();
+    LINK = await freePort();
     HOME = sandbox();
 
     child = spawn(process.execPath, [path.join(__dirname, 'portdash.js')], {
@@ -354,6 +355,51 @@ describe('a running PortDash', () => {
     assert.match(icon.body, /^<svg /);
     assert.match(icon.body, /viewBox="0 0 32 32"/);
     assert.equal(ico.code, 204, 'browsers that ask for .ico anyway should get nothing, not a 404');
+  });
+
+  it('recognises a server it did not start, reached through a symlink', async () => {
+    // The case that hid behind the last CI failure. lsof reports a working directory
+    // with its symlinks resolved; a project's cwd is whatever path was walked or typed.
+    // Compare those two strings directly and a machine where ~/code points at another
+    // volume never matches anything — and nothing fails, the row just sits there saying
+    // stopped, which is the worst way for a feature to be missing.
+    const real = path.join(HOME, 'linked-app');
+    fs.mkdirSync(real, { recursive: true });
+    fs.writeFileSync(path.join(real, 'server.js'),
+      `require('http').createServer((q, s) => s.end('ok')).listen(${LINK}, '127.0.0.1');\n`);
+    const link = path.join(HOME, 'via-link');
+    fs.symlinkSync(real, link);
+
+    // Registered at the link, running from the real path.
+    const reg = registry();
+    reg.push({ id: 'linked', name: 'linked', cwd: link, cmd: 'node server.js', kind: 'node',
+               port: LINK, memMB: null, heapMB: null, pinned: false });
+    setRegistry(reg);
+
+    // Started by us, not through PortDash — a project it started is matched by its own
+    // records and would never exercise the directory comparison at all.
+    const outside = spawn(process.execPath, ['server.js'],
+      { cwd: real, detached: true, stdio: 'ignore' });
+    // unref, or this process cannot exit while that server is alive. Without it a single
+    // failed assertion here stops being a failed assertion and becomes a run that hangs
+    // until CI gives up ten minutes later, which is a much worse way to be told.
+    outside.unref();
+    started.push(outside.pid);
+
+    try {
+      const row = await until('linked', (x) => x.pid);
+      assert.ok(row.pid, 'it should have found the process running in that directory');
+      assert.equal(row.pid, outside.pid);
+      assert.equal(row.source, 'external');
+      assert.ok(row.ports.includes(LINK));
+    } finally {
+      // In a finally because the tidying matters most on the path where an assertion
+      // threw: that is the run that would otherwise leave a server holding a port.
+      try { process.kill(-outside.pid, 'SIGKILL'); } catch (e) { /* already gone */ }
+      const i = started.indexOf(outside.pid);
+      if (i >= 0) started.splice(i, 1);
+      setRegistry(registry().filter((p) => p.id !== 'linked'));
+    }
   });
 
   it('refuses to restart something it has no way to start again, without stopping it', async () => {

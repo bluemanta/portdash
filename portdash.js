@@ -105,6 +105,30 @@ function expand(p) {
 const fmtMB = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(1) + 'G' : Math.round(mb) + 'M');
 const shorten = (p) => (p.startsWith(HOME) ? '~' + p.slice(HOME.length) : p);
 
+/**
+ * A path with its symlinks resolved, remembered after the first look.
+ *
+ * Every comparison between "where this project is" and "where that process is running"
+ * goes through here, because the two sides arrive in different forms. lsof reports a
+ * working directory with the links already resolved; a project's cwd is whatever path
+ * was walked or typed. On a machine where ~/code points at another volume — or anything
+ * under /tmp on macOS, where it resolves to /private/tmp — those strings never match,
+ * and a server started outside PortDash is silently never recognised. Silently is the
+ * problem: nothing fails, the row just sits there saying stopped.
+ *
+ * Stored paths are left alone. What the person sees stays the path they know; only the
+ * comparison is normalised, so no registry needs rewriting for this to start working.
+ *
+ * A failed resolve is deliberately not cached — a directory that doesn't exist yet is a
+ * different thing from one that has no links to follow, and it may well exist later.
+ */
+const realSeen = {};
+function realOf(p) {
+  if (!p) return p;
+  if (realSeen[p]) return realSeen[p];
+  try { return (realSeen[p] = fs.realpathSync(p)); } catch (e) { return p; }
+}
+
 /** Everything PortDash says about itself goes here as well as to stdout. As a launch
     agent stdout is discarded, so this file is the only record — and since nothing else
     ever truncates it, it has to rotate itself. */
@@ -587,7 +611,7 @@ function scanProjects() {
   for (const r of cfg.scanRoots) walk(expand(r), 0, cfg, found);
 
   const reg = getReg();
-  const known = new Set(reg.map((p) => p.cwd));
+  const known = new Set(reg.map((p) => realOf(p.cwd)));
 
   // Entries written by an earlier scan all carry the same static command. Repair the
   // ones that are still exactly as generated — no recorded port, and a command nobody
@@ -603,7 +627,7 @@ function scanProjects() {
 
   let added = 0;
   for (const f of found) {
-    if (known.has(f.cwd)) continue;        // never overwrite an already-registered project (keeps your edits)
+    if (known.has(realOf(f.cwd))) continue;   // never overwrite an already-registered project (keeps your edits)
     const port = f.kind === 'static' ? freeStaticPort(reg) : null;
     reg.push({ id: idOf(f.cwd), name: f.name, cwd: f.cwd,
                cmd: port ? staticCmd(port) : f.cmd, kind: f.kind,
@@ -1128,11 +1152,11 @@ function buildState(fresh) {
 
   const projects = reg.map((p) => {
     let pid = null, source = null;
-    if (p.cwd === SELF_DIR) { pid = process.pid; source = 'self'; }
+    if (realOf(p.cwd) === realOf(SELF_DIR)) { pid = process.pid; source = 'self'; }
     const m = managed[p.id];
     if (!pid && m && byPid[m.pid]) { pid = m.pid; source = 'managed'; }
     if (!pid) {
-      const hit = L.find((r) => C[r.pid] === p.cwd);
+      const hit = L.find((r) => realOf(C[r.pid]) === realOf(p.cwd));
       if (hit) { pid = hit.pid; source = 'external'; }
     }
 
@@ -1215,7 +1239,7 @@ function signalGroup(pgid, sig) {
   try { process.kill(pgid, sig); return sent(); } catch (e) { return false; }
 }
 
-const isSelfProject = (id) => { const p = getReg().find((x) => x.id === id); return !!(p && p.cwd === SELF_DIR); };
+const isSelfProject = (id) => { const p = getReg().find((x) => x.id === id); return !!(p && realOf(p.cwd) === realOf(SELF_DIR)); };
 
 /** PortDash can't be driven from its own dashboard. Stopping it hands control to whatever
     supervises it (launchd restarts it, a shell doesn't), and SIGSTOP would freeze the only
@@ -1241,7 +1265,7 @@ function startProject(id) {
   const lim = getCfg().limits;
   const p = getReg().find((x) => x.id === id);
   if (!p) throw new Error('Project not found');
-  refuseSelf({ source: p.cwd === SELF_DIR ? 'self' : null });
+  refuseSelf({ source: realOf(p.cwd) === realOf(SELF_DIR) ? 'self' : null });
   if (!p.cmd) throw new Error('No start command configured for this project — click "Edit" and set one (e.g. npm run dev)');
   if (!fs.existsSync(p.cwd)) throw new Error('Directory does not exist: ' + p.cwd);
 
@@ -1669,7 +1693,7 @@ const server = http.createServer(async (req, res) => {
         if (!body.cwd) throw new Error("Couldn't determine this process's working directory, can't register it");
         if (!registrable(body.cwd)) throw new Error(`${body.cwd} doesn't look like a project directory — it's a system or sandboxed-app path`);
         const reg = getReg();
-        if (reg.some((x) => x.cwd === body.cwd)) throw new Error('This directory is already registered');
+        if (reg.some((x) => realOf(x.cwd) === realOf(body.cwd))) throw new Error('This directory is already registered');
         const d = detectProject(body.cwd) || { name: path.basename(body.cwd), cmd: '', kind: 'unknown' };
         // This one is already listening, so its port is a fact rather than a guess — a
         // generated static command should name that port instead of the generic 8000.
