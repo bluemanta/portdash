@@ -2,6 +2,8 @@
 
 A visual control panel for local dev servers. Single file, zero dependencies — just Node's built-in modules.
 
+[![tests](https://github.com/bluemanta/portdash/actions/workflows/test.yml/badge.svg)](https://github.com/bluemanta/portdash/actions/workflows/test.yml)
+
 [中文说明](README.zh-CN.md)
 
 ## Run it
@@ -20,7 +22,7 @@ node portdash.js
 
 Then open http://localhost:7777
 
-**Platform**: built and tested on macOS. The Linux code path (`/proc/meminfo`, `lsof`, `ps`) is implemented but not yet verified on a real machine — issues and PRs welcome. Windows isn't supported.
+**Platform**: built for macOS, where all of it works. The Linux path — `/proc/meminfo` instead of `vm_stat`, and no `launchctl`, so ownership falls back to walking parent processes — now runs the whole test suite on every push and passes it. That is verification, not mileage: nobody has yet lived with it on Linux the way this was lived with on a Mac, so issues and PRs are welcome. Windows isn't supported.
 
 ## Keeping the watchdog on (optional)
 

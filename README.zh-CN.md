@@ -2,6 +2,8 @@
 
 本地开发服务的可视化控制台。零依赖单文件，只用 Node 自带模块。
 
+[![tests](https://github.com/bluemanta/portdash/actions/workflows/test.yml/badge.svg)](https://github.com/bluemanta/portdash/actions/workflows/test.yml)
+
 [English](README.md)
 
 ## 运行
