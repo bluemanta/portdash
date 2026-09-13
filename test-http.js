@@ -304,8 +304,18 @@ describe('a running PortDash', () => {
 
   it('refuses to start something else onto a port that is taken', async () => {
     // Registry changes are read from disk on every call, so adding one here is enough.
+    //
+    // It gets a directory of its own. Pointing it at the running fixture's directory
+    // made it a *second project at the same path*, which PortDash matches to the
+    // process already running there and refuses as "already running" long before it
+    // reaches the port check — and which /api/register will not let anyone create in
+    // the first place. That version passed on macOS and failed on Linux with identical
+    // code, because the match compares the cwd string lsof reports against the one on
+    // record, and macOS resolves /tmp to /private/tmp while Linux does not.
+    const dir = path.join(HOME, 'clash');
+    fs.mkdirSync(dir, { recursive: true });
     const reg = registry();
-    reg.push({ id: 'clash', name: 'clash', cwd: path.join(HOME, 'fixture-app'),
+    reg.push({ id: 'clash', name: 'clash', cwd: dir,
                cmd: 'node server.js', kind: 'node', port: APP,
                memMB: null, heapMB: null, pinned: false });
     setRegistry(reg);
