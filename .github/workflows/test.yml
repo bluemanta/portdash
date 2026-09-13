@@ -1,0 +1,55 @@
+# Runs the test suite on a machine that isn't the one the code was written on.
+#
+# Two axes, both of them there for a reason rather than for completeness:
+#
+# Linux is in the matrix because README.md says the Linux path is "implemented but not
+# yet verified on a real machine". This is that machine. The parts that differ are real
+# ones — /proc/meminfo instead of vm_stat, no launchctl at all — so a green run here is
+# the first evidence that claim holds, and a red one is worth more than the claim was.
+#
+# Node 18 is the oldest version with the built-in test runner, and 22 is what people
+# actually have. PortDash itself still supports 16; the tests are what need 18, so 16 is
+# not in the matrix and `engines` is what states the real floor.
+#
+# fail-fast is off because the interesting outcome is *which* combinations fail. Stopping
+# the others the moment one goes red would hide exactly the thing worth seeing.
+#
+# There is no install step and no cache: this package has no dependencies, which is the
+# point of it, and `actions/setup-node` with caching enabled needs a lockfile that does
+# not and should not exist here.
+
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        node: [18, 22]
+
+    name: ${{ matrix.os }} · node ${{ matrix.node }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # The suite starts a real PortDash as a child process and inspects the machine's
+      # own process table, so it is worth knowing what that machine had when a run fails.
+      - name: What this runner has
+        run: |
+          node --version
+          uname -a
+          command -v lsof || echo "lsof: NOT PRESENT"
+          command -v ps   || echo "ps: NOT PRESENT"
+
+      - run: npm test
