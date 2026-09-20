@@ -1585,6 +1585,31 @@ function roomierLimit(currentMB, hardMB) {
     notice on screen with nothing left to take it down. */
 const SYS_STANDING = ['sys:none', 'sys:small'];
 
+/**
+ * What to say after a system-pressure freeze, beyond the fact of it.
+ *
+ * It used to say "close something else, then resume it", which is the right instruction
+ * and no help at all: the one thing the reader needs is which something, and they were
+ * left to go and find it in Activity Monitor. It also called the frozen project "the
+ * biggest consumer", which is only ever true of the handful of things PortDash started —
+ * on a machine where a browser is holding six gigabytes it is a claim about a set of one,
+ * and it sends somebody off to optimise a dev server that was never the problem.
+ *
+ * Whether the frozen project really is the machine's heaviest changes what there is to
+ * say, so it decides the whole clause rather than being tacked on:
+ *
+ *   - it is  → this is the thing to look at, and the logs are where to look
+ *   - it isn't → name what is, because freeing that is what will actually help
+ *   - nothing to compare against → the old wording, which is at least not wrong
+ */
+function freezeAdvice(top, topIsVictim) {
+  if (!top) return ' Close something else, then resume it.';
+  if (topIsVictim) {
+    return ' Nothing else on this machine is holding more, so this is the one to look at — check its logs before resuming it.';
+  }
+  return ` That isn't what's using the most, though: ${top.name} is holding ${fmtMB(top.rss)}. Free some of that, then resume.`;
+}
+
 function watchdog() {
   const lim = getCfg().limits;
   if (!lim.enabled) return;
@@ -1684,27 +1709,36 @@ function watchdog() {
   const why = low ? `only ${sm.availPct}% memory available`
                   : `swap at ${fmtMB(sm.swapUsedMB)} with only ${sm.availPct}% memory available`;
 
+  // All three notices below need the same two facts: what is really holding the memory,
+  // and whether that happens to be the project they are already about. Naming it twice in
+  // one sentence is the same number twice.
+  const top = topConsumer(byPid, rssByPgid);
+  const topIsVictim = !!(top && victim && top.pgid === victim.pgid);
+
   // Freezing a process that isn't actually holding much won't give the system anything
   // back — it just breaks the user's work for nothing.
   if (victim && victim.rss >= lim.minVictimMB) {
     signalGroup(victim.pgid, 'SIGSTOP');
     // No "allow more" here: the machine ran out, not this project's own allowance, so
     // raising its limit would change nothing about why it was frozen.
-    alert_('danger', `${why} — froze "${victim.name}" (${fmtMB(victim.rss)}), the biggest consumer, to protect the system. Close something else, then resume it.`,
+    alert_('danger', `${why} — froze "${victim.name}" (${fmtMB(victim.rss)}), the biggest of the services PortDash started, to protect the system.${freezeAdvice(top, topIsVictim)}`,
            victim.id, 'sys:' + victim.id, [{ act: 'resume', id: victim.id, label: 'Resume' }]);
     return;
   }
 
   // Nothing was frozen, so the only thing these can offer is a name to go and deal with.
-  // Withheld when it is the project already being discussed, which would just be the same
-  // number twice in one sentence.
-  const top = topConsumer(byPid, rssByPgid);
-  const blame = top && !(victim && top.pgid === victim.pgid)
+  const blame = top && !topIsVictim
     ? ` The most memory on this machine is ${top.name}'s: ${fmtMB(top.rss)}.` : '';
 
   if (victim) {
     standingAlert('warn', `${why}. The biggest thing PortDash started is only "${victim.name}" (${fmtMB(victim.rss)}), so freezing it wouldn't give the system enough back to be worth the interruption.${blame}`,
                   'sys:small');
+  } else if (running.length) {
+    // Reached one tick after a freeze, while the pressure is still on: there is something
+    // it started, and it is the thing that was just frozen. The other wording would say
+    // PortDash started none of this, a sentence away from a notice saying it froze one.
+    standingAlert('warn', `${why}. Everything PortDash started here is already frozen, so there is nothing further it can do.${blame}`,
+                  'sys:none');
   } else {
     standingAlert('warn', `${why}. PortDash didn't start any of the services running here, so it has nothing it can freeze for you.${blame}`,
                   'sys:none');
@@ -2628,7 +2662,7 @@ module.exports = {
   etimeToSec, sameProcess, processTable, listeners, sysMem,
   whichIn, envSummary, doctor,
   buildState, procs, ports, invalidate,
-  probe, healthFor, roomierLimit, MIN_LIMIT_MB, refuseSystemAgent,
+  probe, healthFor, roomierLimit, MIN_LIMIT_MB, refuseSystemAgent, freezeAdvice,
   getAlerts: () => alerts,
   resetAlerts: () => { alerts = []; for (const k of Object.keys(alertSeen)) delete alertSeen[k]; },
   standingAlert, dropAlert,

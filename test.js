@@ -369,6 +369,27 @@ describe('naming what is actually eating the memory', () => {
   it('does not fall over on an empty machine', () => {
     assert.equal(pd.topConsumer({}, {}), null);
   });
+
+  it('sends you after the thing that is actually holding the memory', () => {
+    // "Close something else, then resume it" is the right instruction and no help: which
+    // something is the only part the reader doesn't already know.
+    const hog = { pgid: 10, rss: 6553, name: 'ChatGPT' };
+    assert.match(pd.freezeAdvice(hog, false), /ChatGPT is holding 6\.4G/);
+    assert.match(pd.freezeAdvice(hog, false), /Free some of that/);
+  });
+
+  it('does not send you after the project it just froze', () => {
+    // When the frozen project really is the machine's heaviest there is nothing else to
+    // close, and saying its name and its size a second time in the same sentence reads as
+    // though two separate things are at fault.
+    const advice = pd.freezeAdvice({ pgid: 10, rss: 6553, name: 'ChatGPT' }, true);
+    assert.doesNotMatch(advice, /ChatGPT|6\.4G/);
+    assert.match(advice, /check its logs/i);
+  });
+
+  it('keeps the old wording when it has nothing to compare against', () => {
+    assert.match(pd.freezeAdvice(null, false), /Close something else/);
+  });
 });
 
 // ---------------------------------------------------------------------- ports
