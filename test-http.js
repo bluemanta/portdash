@@ -402,6 +402,59 @@ describe('a running PortDash', () => {
     }
   });
 
+  it('stops a stray instance by pid, and nothing else sharing its process group', async () => {
+    // Every other Stop in here signals a process group, because a dev server is a shell
+    // and a compiler and whatever else it forked. A PortDash is the one thing that must
+    // not be: it detaches every service it starts into a group of its own, so its group
+    // holds nothing of its own — and it can very easily hold somebody else. Two started
+    // from one terminal line share a group, and one of the two is the dashboard you are
+    // pressing the button in. That is not a thought experiment; it is what happened while
+    // this feature was being checked by hand, and both processes died at once.
+    const dir = path.join(HOME, 'fake-pd');
+    fs.mkdirSync(dir, { recursive: true });
+    // Named portdash.js because that is what the pid check looks at, and it must still
+    // pass at the moment of the press or nothing is signalled at all.
+    fs.writeFileSync(path.join(dir, 'portdash.js'), 'setInterval(() => {}, 1e9);\n');
+
+    // A home of their own, so PortDash reads them as strays rather than as copies sharing
+    // its settings, and detached so the group they land in is theirs and not this runner's
+    // — a regression here would otherwise kill the test process instead of failing it.
+    const strayHome = path.join(HOME, 'stray-home');
+    fs.mkdirSync(strayHome, { recursive: true });
+    const script = path.join(dir, 'portdash.js');
+    const sh = spawn('/bin/sh', ['-c', `"${process.execPath}" "${script}" & "${process.execPath}" "${script}" & wait`],
+      { detached: true, stdio: 'ignore', env: Object.assign({}, process.env, { HOME: strayHome }) });
+    sh.unref();
+    started.push(sh.pid);
+
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return false; } };
+    try {
+      let pair = [];
+      for (let i = 0; i < 60 && pair.length < 2; i++) {
+        await sleep(100);
+        pair = require('child_process').execFileSync('ps', ['-eo', 'pid=,pgid=,command='], { encoding: 'utf8' })
+          .split('\n')
+          .map((l) => l.trim().split(/\s+/))
+          // Matched on the two argv entries rather than on the line containing the path,
+          // because the shell's own line contains it too — it is in the -c argument it
+          // was handed — and the shell is not one of the stand-ins.
+          .filter((t) => Number(t[1]) === sh.pid && t[2] === process.execPath && t[3] === script)
+          .map((t) => Number(t[0]));
+      }
+      assert.equal(pair.length, 2, 'both stand-ins should be up, in one process group');
+
+      const [target, bystander] = pair;
+      assert.equal((await post('/api/stop-stray', { pid: target })).code, 200);
+      for (let i = 0; i < 40 && alive(target); i++) await sleep(100);
+      assert.equal(alive(target), false, 'the one that was asked for should be gone');
+      assert.equal(alive(bystander), true, 'the one that merely shared its group should not be');
+    } finally {
+      try { process.kill(-sh.pid, 'SIGKILL'); } catch (e) { /* already gone */ }
+      const i = started.indexOf(sh.pid);
+      if (i >= 0) started.splice(i, 1);
+    }
+  });
+
   it('refuses to restart something it has no way to start again, without stopping it', async () => {
     // Restart is stop-then-start, and the start is the half that fails. Before the guard
     // this stopped the service and handed back an error: the button took the thing away.

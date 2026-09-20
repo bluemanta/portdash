@@ -413,7 +413,7 @@ function alert_(level, text, projectId, key, actions) {
   if (alertSeen[k] && now - alertSeen[k] < 60000) return;
   alertSeen[k] = now;
   alerts.unshift({ id: crypto.randomBytes(4).toString('hex'), t: now, level, text, projectId,
-                   actions: actions || [] });
+                   key: k, actions: actions || [] });
   alerts = alerts.slice(0, 20);
   logLine(`[${level === 'danger' ? 'action' : 'notice'}] ${text}`);
   if (projectId) {
@@ -422,6 +422,42 @@ function alert_(level, text, projectId, key, actions) {
         `\n***** ${new Date().toLocaleString()}  PortDash: ${text} *****\n`);
     } catch (e) { /* ignore */ }
   }
+}
+
+/** Withdraw a notice whose subject has gone. A notice is a claim about the machine as it
+    is right now, and "this process is running, here is a button that stops it" stops
+    being true the moment the process exits — at which point it is not merely noise, it
+    is a button pointed at whatever inherits the number. Nothing else prunes: an alert
+    sits there until someone clicks the ×, which is correct for a freeze that happened
+    and wrong for a process that is no longer there. The dedupe window goes with it, so
+    the same thing happening again is allowed to say so again. */
+function dropAlert(key) {
+  alerts = alerts.filter((a) => a.key !== key);
+  delete alertSeen[key];
+}
+
+/**
+ * A notice about a condition rather than an event, kept as one row for as long as the
+ * condition lasts.
+ *
+ * alert_ is built for things that happened: "this was frozen" twice is two things worth
+ * knowing, and the minute-long dedupe window exists so a burst of them doesn't bury the
+ * page. A condition doesn't work that way. "The machine is short of memory" is true or it
+ * isn't, and re-posting it every minute while it stays true produced eleven rows saying
+ * the same sentence with a percentage one point apart — a reader has to get through all
+ * of them to find out they are one problem, and they outlast it by hours. Observed on a
+ * real dashboard, which is what prompted this.
+ *
+ * So the text is refreshed in place and the row stays put, which also keeps the log to
+ * one line per episode instead of one a minute. Whoever posts it is responsible for
+ * calling dropAlert when the condition lifts; nothing here can know that.
+ */
+function standingAlert(level, text, key, actions) {
+  const open = alerts.find((a) => a.key === key);
+  if (!open) return alert_(level, text, null, key, actions);
+  open.level = level;
+  open.text = text;
+  open.actions = actions || [];
 }
 
 // ---------------------------------------------------------------- start failures
@@ -678,6 +714,36 @@ function processTable() {
   return { byPid, rssByPgid };
 }
 
+/**
+ * The heaviest process group on the machine, named — the one fact the memory-pressure
+ * notices were missing.
+ *
+ * They used to say the top consumer wasn't started by PortDash without ever having
+ * looked at what it was: true, and useless. Being told the machine is out of memory and
+ * that this program won't help leaves the reader to go and open Activity Monitor, which
+ * is the entire question they had. The watchdog is holding a fresh process table with
+ * per-group totals at that exact moment, so the answer costs nothing.
+ *
+ * Grouped by pgid like every other memory figure here, so an app and its thirty helper
+ * processes read as one number rather than thirty innocent-looking ones. Named after the
+ * group leader, which is the app itself and which procName resolves to a bundle name;
+ * after the heaviest member when the leader has already exited.
+ */
+function topConsumer(byPid, rssByPgid) {
+  let pgid = null, rss = 0;
+  for (const [g, mb] of Object.entries(rssByPgid)) {
+    if (mb > rss) { rss = mb; pgid = Number(g); }
+  }
+  if (pgid === null) return null;
+  let named = byPid[pgid];
+  if (!named) {
+    for (const p of Object.values(byPid)) {
+      if (p.pgid === pgid && (!named || p.rssMB > named.rssMB)) named = p;
+    }
+  }
+  return named ? { pgid, rss: Math.round(rss), name: procName(named.command) } : null;
+}
+
 /** "MM:SS", "HH:MM:SS" or "DD-HH:MM:SS" → seconds. null if it doesn't parse. */
 function etimeToSec(etime) {
   const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(String(etime || '').trim());
@@ -795,8 +861,22 @@ function pruneManaged(byPid) {
 // freeze. So the older process keeps the watchdog and the younger stands down:
 // comparing elapsed time needs no lock file, and both sides reach the same answer.
 //
-// A sibling with its own HOME can't corrupt anything, but it is still running ps and
-// vm_stat every two seconds to supervise nothing, so it gets said out loud once.
+// A sibling with its own HOME can't corrupt anything, and nothing else on this page will
+// ever mention it, so it gets said out loud once.
+//
+// Saying it was the easy half. The notice used to end "it's listed below under Other
+// processes — stop it there", and that list is built purely from listening sockets. The
+// ordinary stray is precisely the one with no socket: it came up with default settings,
+// found this process already holding the UI port, and has been retrying the bind on a
+// slow timer ever since. Sent to look for a row that cannot exist, with no other way to
+// act on what it had just been told. For the same reason the notice no longer claims the
+// thing is scanning every two seconds — that timer starts inside the listen callback, so
+// the instance that couldn't bind isn't doing anything at all.
+//
+// So the notice carries the button instead of pointing at one, and takes itself down
+// when the pid does. Both halves matter: a notice about a process that has since exited
+// is how one of these ends up being read hours later, and the button on it would be
+// aimed at a reused number.
 
 /** Is this command line a running PortDash? Matched on the script the interpreter was
     given rather than on the whole line — "vim portdash.js" is not another instance. */
@@ -833,10 +913,40 @@ function otherInstances(byPid) {
 const sibSaid = new Set();          // once per process, not once a minute forever
 const SIBLING_QUIET_SEC = 60;       // how long one has to last before it's worth saying
 
+/** Where a stray came from, when its own settings path says so plainly. A ~/.portdash
+    under the system temporary directory is not something anybody configures — it is what
+    a test run with an isolated HOME leaves behind — and naming that is the difference
+    between a notice someone can act on and one that sends them to look at a directory
+    which has already been deleted.
+ *
+ *  Both spellings of the temporary directory have to be checked, because realpath is no
+ *  help on exactly the paths this cares about. On macOS the temporary directory lives
+ *  under /var, which is a link to /private/var; a directory that still exists resolves to
+ *  the second spelling, and one that has already been cleaned up keeps the first. Cleaned
+ *  up is the normal case here — a test run tidying after itself while its PortDash lives
+ *  on is how most of these come about. */
+const TMPDIRS = [...new Set([os.tmpdir(), realOf(os.tmpdir())])];
+function strayOrigin(root) {
+  if (!root) return '';
+  const p = realOf(root);
+  return TMPDIRS.some((d) => p.startsWith(d + path.sep))
+    ? " Its settings are in a temporary directory, so it was almost certainly left behind by a test run."
+    : '';
+}
+
 /** The instance that should be supervising instead of this one, if any. Siblings that
     can't interfere are reported here too, since this is the one place that sees them. */
 function supersededBy(byPid) {
   const mine = process.uptime();
+  // Retract notices about instances that have since exited, for the same reason rootSeen
+  // is pruned: what is left is a claim about a pid that now means nothing, carrying a
+  // button that would signal whoever the kernel gave the number to next.
+  for (const pid of [...sibSaid]) {
+    if (byPid[pid]) continue;
+    sibSaid.delete(pid);
+    dropAlert('sib:' + pid);
+    dropAlert('sib:shared:' + pid);
+  }
   for (const s of otherInstances(byPid)) {
     if (s.root !== ROOT) {
       // One that has only just appeared is somebody working — a test run, an npx
@@ -848,8 +958,8 @@ function supersededBy(byPid) {
       const age = etimeToSec(s.etime);
       if (age !== null && age >= SIBLING_QUIET_SEC && !sibSaid.has(s.pid)) {
         sibSaid.add(s.pid);
-        alert_('warn', `Another PortDash has been running for ${s.etime} (pid ${s.pid}), with its own settings under ${s.root ? shorten(s.root) : 'a home directory this one can\'t read'}. It can't see your projects and isn't supervising anything, but it still scans this machine every two seconds. It's listed below under "Other processes" — stop it there.`,
-               null, 'sib:' + s.pid);
+        alert_('warn', `Another PortDash (pid ${s.pid}) has been running for ${s.etime}, with its own settings under ${s.root ? shorten(s.root) : "a home directory this one can't read"}. It can't see your projects and isn't supervising anything.${strayOrigin(s.root)}`,
+               null, 'sib:' + s.pid, [{ act: 'stop-stray', pid: s.pid, label: 'Stop it' }]);
       }
       continue;
     }
@@ -1379,6 +1489,43 @@ function stopTarget(body) {
   return { ok: true };
 }
 
+/** Stop a stray instance from the notice that reported it, rather than making the person
+    find it themselves — the whole point of the notice is that it is the only thing that
+    knows the process is there.
+ *
+ *  Not /api/stop with a pid, because of the gap between the notice appearing and someone
+ *  reading it. The notice can sit on screen for hours, the stray can exit in the middle
+ *  of that, and a pid gets handed out again. So the number has to still be a PortDash,
+ *  and still not this one, at the moment the button is pressed; the alternative is a
+ *  button that occasionally SIGTERMs the process group of a program nobody mentioned.
+ *  supersededBy withdraws these notices within a couple of seconds of the process going,
+ *  which closes most of that window — this is the part that doesn't depend on a timer
+ *  having run, and on a dashboard left open overnight it's the part that matters. */
+function stopStray(body) {
+  const pid = Number(body.pid);
+  if (!Number.isInteger(pid) || pid < 2) throw new Error(`Not a valid pid: ${body.pid}`);
+  if (pid === process.pid) throw new Error('That pid is this PortDash — stop it wherever it was launched from, not from here.');
+  const info = procs(true).byPid[pid];
+  if (!info) throw new Error(`Pid ${pid} isn't running any more — it stopped on its own, so there is nothing to do.`);
+  if (!isPortdash(info.command)) {
+    throw new Error(`Pid ${pid} is no longer that PortDash: it exited, and the number now belongs to ${procName(info.command) || 'another program'}. Nothing was stopped.`);
+  }
+  // This pid alone, never its process group — the one place in here that doesn't go
+  // through signalGroup. Stopping a service means stopping its group, because a dev
+  // server is a shell and a compiler and whatever else it forked. A PortDash has none of
+  // that: every service it starts is detached into a group of its own, so its group holds
+  // nothing that belongs to it. What the group can hold is somebody else, and the most
+  // likely somebody is this process — two started from the same terminal line share a
+  // group. Found by doing exactly that: the group signal stopped the stray and the
+  // dashboard that sent it, together, and the dashboard had no idea why it was dying.
+  try { process.kill(pid, 'SIGCONT'); } catch (e) { /* frozen or already gone */ }
+  try { process.kill(pid, 'SIGTERM'); } catch (e) { /* went in the moment since the check */ }
+  setTimeout(() => {
+    if (alive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch (e) { /* ignore */ } }
+  }, 3000);
+  return { ok: true };
+}
+
 const waitGone = (pid, ms) => new Promise((resolve) => {
   const t0 = Date.now();
   const tick = () => (!alive(pid) || Date.now() - t0 > ms) ? resolve() : setTimeout(tick, 200);
@@ -1431,6 +1578,12 @@ function roomierLimit(currentMB, hardMB) {
   const next = Math.max(currentMB * 2, MIN_LIMIT_MB);
   return next < hardMB ? next : null;
 }
+
+/** The pressure notices that stand while the machine is under pressure and are withdrawn
+    when it isn't. Named in one place because posting them and retracting them happen at
+    opposite ends of the same function, and a key that only matches on one side leaves a
+    notice on screen with nothing left to take it down. */
+const SYS_STANDING = ['sys:none', 'sys:small'];
 
 function watchdog() {
   const lim = getCfg().limits;
@@ -1515,7 +1668,17 @@ function watchdog() {
   // thrashing when memory is tight at the same time.
   const low = sm.availPct < lim.sysAvailFloorPct;
   const thrashing = sm.swapUsedMB > lim.sysSwapCeilMB && sm.availPct < lim.sysAvailFloorPct * 2;
-  if (!low && !thrashing) return;
+  if (!low && !thrashing) {
+    // The two notices below describe the machine as it is this second, so they go when it
+    // stops being like that. The freeze notice above deliberately doesn't: that one
+    // records something that was done, and the service is still stopped and still waiting
+    // for somebody to decide what happens to it.
+    if (SYS_STANDING.some((k) => alerts.some((a) => a.key === k))) {
+      logLine(`Memory pressure has passed — ${sm.availPct}% available, swap ${fmtMB(sm.swapUsedMB)}.`);
+    }
+    SYS_STANDING.forEach(dropAlert);
+    return;
+  }
 
   const victim = running.filter((r) => !r.paused).sort((a, b) => b.rss - a.rss)[0];
   const why = low ? `only ${sm.availPct}% memory available`
@@ -1529,10 +1692,22 @@ function watchdog() {
     // raising its limit would change nothing about why it was frozen.
     alert_('danger', `${why} — froze "${victim.name}" (${fmtMB(victim.rss)}), the biggest consumer, to protect the system. Close something else, then resume it.`,
            victim.id, 'sys:' + victim.id, [{ act: 'resume', id: victim.id, label: 'Resume' }]);
-  } else if (victim) {
-    alert_('warn', `${why}, but the biggest thing PortDash started is only "${victim.name}" (${fmtMB(victim.rss)}) — freezing it wouldn't help, so it's been left alone.`, null, 'sys:small');
+    return;
+  }
+
+  // Nothing was frozen, so the only thing these can offer is a name to go and deal with.
+  // Withheld when it is the project already being discussed, which would just be the same
+  // number twice in one sentence.
+  const top = topConsumer(byPid, rssByPgid);
+  const blame = top && !(victim && top.pgid === victim.pgid)
+    ? ` The most memory on this machine is ${top.name}'s: ${fmtMB(top.rss)}.` : '';
+
+  if (victim) {
+    standingAlert('warn', `${why}. The biggest thing PortDash started is only "${victim.name}" (${fmtMB(victim.rss)}), so freezing it wouldn't give the system enough back to be worth the interruption.${blame}`,
+                  'sys:small');
   } else {
-    alert_('warn', `${why}, but the top consumer wasn't started by PortDash — you'll need to handle it yourself.`, null, 'sys:none');
+    standingAlert('warn', `${why}. PortDash didn't start any of the services running here, so it has nothing it can freeze for you.${blame}`,
+                  'sys:none');
   }
 }
 
@@ -1632,6 +1807,7 @@ const server = http.createServer(async (req, res) => {
       if (u.pathname === '/api/scan')    return json(res, 200, scanProjects());
       if (u.pathname === '/api/start')   return json(res, 200, startProject(body.id));
       if (u.pathname === '/api/stop')    return json(res, 200, stopTarget(body));
+      if (u.pathname === '/api/stop-stray') return json(res, 200, stopStray(body));
       if (u.pathname === '/api/restart') return json(res, 200, await restartProject(body.id));
       if (u.pathname === '/api/pause')   return json(res, 200, { ok: signalGroup(resolveTarget(body).pgid, 'SIGSTOP') });
       if (u.pathname === '/api/resume')  return json(res, 200, { ok: signalGroup(resolveTarget(body).pgid, 'SIGCONT') });
@@ -2195,6 +2371,15 @@ document.addEventListener('click', async (e)=>{
     if(r.hasNode) await api('/api/dismiss',{alertId:b.dataset.alert});
     return load();
   }
+  // Whichever way this goes the notice has served its purpose and shouldn't stay: either
+  // the process is gone now, or it was already gone and the error said so. Leaving it up
+  // invites a second press against a number that means even less than it did.
+  if(a==='stop-stray'){
+    b.disabled=true; b.textContent='Stopping…';
+    try{ await api('/api/stop-stray',{pid:pid}); }catch(e){ /* api() has already said why */ }
+    await api('/api/dismiss',{alertId:b.dataset.alert});
+    return setTimeout(load,350);
+  }
   if(a==='raise'){
     await api('/api/raise-limit',{id:id,memMB:+b.dataset.mb});
     await api('/api/dismiss',{alertId:b.dataset.alert});
@@ -2229,7 +2414,8 @@ async function load(){
   alerts.innerHTML=(s.alerts||[]).map(a=>'<div class="alert '+a.level+'"><div>'+esc(a.text)+'</div>'
     +((a.actions||[]).length?'<span class="go">'+a.actions.map(x=>
         '<button data-act="'+esc(x.act)+'" data-alert="'+a.id+'"'
-        +(x.id?' data-id="'+esc(x.id)+'"':'')+(x.mb?' data-mb="'+x.mb+'"':'')
+        +(x.id?' data-id="'+esc(x.id)+'"':'')+(x.pid?' data-pid="'+x.pid+'"':'')
+        +(x.mb?' data-mb="'+x.mb+'"':'')
         +'>'+esc(x.label)+'</button>').join('')+'</span>':'')
     +'<button class="x" data-act="dismiss" data-alert="'+a.id+'">×</button></div>').join('');
 
@@ -2436,7 +2622,7 @@ Config, logs and the API token live in ~/.portdash/`);
  */
 module.exports = {
   procName, ancestors, ownerOf, stopCommand, launchdJobs,
-  isPortdash, supersededBy,
+  isPortdash, supersededBy, strayOrigin, stopStray, topConsumer,
   detectProject, staticCmd, freeStaticPort, idOf, registrable, scanProjects,
   diagnose, missingCommand, lastLine, syncedFolder,
   etimeToSec, sameProcess, processTable, listeners, sysMem,
@@ -2444,7 +2630,8 @@ module.exports = {
   buildState, procs, ports, invalidate,
   probe, healthFor, roomierLimit, MIN_LIMIT_MB, refuseSystemAgent,
   getAlerts: () => alerts,
-  resetAlerts: () => { alerts = []; },
+  resetAlerts: () => { alerts = []; for (const k of Object.keys(alertSeen)) delete alertSeen[k]; },
+  standingAlert, dropAlert,
   _caches: { rootSeen, sibSaid, health, speaksHttp }
 };
 

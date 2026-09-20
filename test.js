@@ -219,6 +219,65 @@ describe('which PortDash keeps the watchdog', () => {
     assert.equal(pd.getAlerts().length, 1);          // once, not once a minute
   });
 
+  it('gives the notice a button rather than sending it to a list', () => {
+    // This is the whole bug. "Other processes" is built from listening sockets, and the
+    // stray that actually happens is the one with no socket: default settings, found the
+    // UI port taken, retrying the bind ever since. The notice used to end "stop it there"
+    // and there was nothing there — a dead end at the one moment somebody wanted to act.
+    reset();
+    pd._caches.rootSeen[995] = '/tmp/pd3/.portdash';
+    pd.supersededBy({ [process.pid]: me, 995: other(995, '99:00:00') });
+    const [a] = pd.getAlerts();
+    assert.deepEqual(a.actions, [{ act: 'stop-stray', pid: 995, label: 'Stop it' }]);
+    assert.doesNotMatch(a.text, /Other processes/);
+    // And it no longer claims the thing is busy: that timer only starts once a bind has
+    // succeeded, so the instance being complained about is usually doing nothing at all.
+    assert.doesNotMatch(a.text, /every two seconds/);
+  });
+
+  it('takes the notice back down when the process goes', () => {
+    // How this was found: the notice was still on screen, naming a pid that had been gone
+    // for an hour, telling someone to go and stop it. Nothing else prunes alerts, which is
+    // right for "this froze" and wrong for "this is running". The button makes it worse
+    // than untidy — pids get reused, so a stale one is aimed at a stranger.
+    reset();
+    pd._caches.rootSeen[994] = '/tmp/pd4/.portdash';
+    pd.supersededBy({ [process.pid]: me, 994: other(994, '99:00:00') });
+    assert.equal(pd.getAlerts().length, 1);
+    pd.supersededBy({ [process.pid]: me });                    // 994 has exited
+    assert.equal(pd.getAlerts().length, 0);
+    // Withdrawn, not silenced: if another one shows up it is worth saying again, and the
+    // 60-second dedupe window would otherwise swallow it.
+    pd._caches.rootSeen[994] = '/tmp/pd4/.portdash';
+    pd.supersededBy({ [process.pid]: me, 994: other(994, '99:00:00') });
+    assert.equal(pd.getAlerts().length, 1);
+  });
+
+  it('names a temporary settings directory for what it is', () => {
+    // A ~/.portdash under the system temp directory is not a configuration, it is what
+    // `npm test` leaves behind. Saying so is the difference between a notice someone can
+    // act on and one that sends them to look at a directory that no longer exists.
+    assert.match(pd.strayOrigin(path.join(os.tmpdir(), 'portdash-x1/.portdash')),
+                 /left behind by a test run/);
+    // Spelled out rather than built from os.homedir(), because this suite runs with a
+    // throwaway HOME under the temporary directory — the real home is the one thing here
+    // that isn't available to compare against.
+    assert.equal(pd.strayOrigin('/Users/someone/.portdash'), '');
+    assert.equal(pd.strayOrigin(null), '');
+  });
+
+  it('will not press Stop on a pid that has stopped meaning what it meant', () => {
+    // The notice can sit on screen for hours and the stray can exit in the middle of
+    // that. Without this the button is a SIGTERM to the process group of whoever the
+    // kernel handed the number to next. Checked against the process table at the moment
+    // of the press, not against what was true when the notice was written.
+    // Whatever ran this suite: certainly alive, certainly not a PortDash.
+    assert.throws(() => pd.stopStray({ pid: process.ppid }), /no longer that PortDash/);
+    assert.throws(() => pd.stopStray({ pid: 4194303 }), /isn't running any more/);
+    assert.throws(() => pd.stopStray({ pid: process.pid }), /this PortDash/);
+    assert.throws(() => pd.stopStray({ pid: 'nonsense' }), /Not a valid pid/);
+  });
+
   it('says nothing about one that has only just appeared', () => {
     // Every run of this suite starts a PortDash with its own temporary home for a few
     // seconds, and posting a notice about each one turns the developer's dashboard into
@@ -237,6 +296,78 @@ describe('which PortDash keeps the watchdog', () => {
     reset();
     pd._caches.rootSeen[996] = null;
     assert.equal(pd.supersededBy({ [process.pid]: me, 996: other(996, '99:00:00') }), null);
+  });
+});
+
+// ------------------------------------------------------- notices about a condition
+
+describe('a notice that describes the machine rather than an event', () => {
+  it('stays one row while the condition lasts, with the numbers refreshed', () => {
+    // What this replaces: eleven rows, one a minute, the same sentence with the
+    // percentage a point apart each time, and the reader having to get through all of
+    // them to work out they were one problem. Seen on a real dashboard.
+    pd.resetAlerts();
+    pd.standingAlert('warn', 'only 12% memory available', 'sys:none');
+    pd.standingAlert('warn', 'only 11% memory available', 'sys:none');
+    pd.standingAlert('warn', 'only 10% memory available', 'sys:none');
+    assert.equal(pd.getAlerts().length, 1);
+    assert.equal(pd.getAlerts()[0].text, 'only 10% memory available');
+  });
+
+  it('goes away when the condition does, and can come straight back', () => {
+    // Coming straight back matters: the 60-second window that stops alert_ flooding would
+    // otherwise swallow the next episode if it began within a minute of the last one
+    // ending, and a machine that is thrashing does exactly that.
+    pd.resetAlerts();
+    pd.standingAlert('warn', 'only 10% memory available', 'sys:none');
+    pd.dropAlert('sys:none');
+    assert.equal(pd.getAlerts().length, 0);
+    pd.standingAlert('warn', 'only 9% memory available', 'sys:none');
+    assert.equal(pd.getAlerts().length, 1);
+  });
+
+  it('keeps the id it was given, so the × still works after a refresh', () => {
+    // Refreshing in place means the row the browser is looking at is the same object. Give
+    // it a new id and the dismiss button on screen points at an alert that no longer
+    // exists, which reads as a button that does nothing.
+    pd.resetAlerts();
+    pd.standingAlert('warn', 'first', 'sys:none');
+    const id = pd.getAlerts()[0].id;
+    pd.standingAlert('warn', 'second', 'sys:none');
+    assert.equal(pd.getAlerts()[0].id, id);
+  });
+});
+
+describe('naming what is actually eating the memory', () => {
+  // Grouped by pgid, because an app is thirty processes and thirty small numbers each
+  // look innocent: 300 + 1400 + 1200 beats a single 1500, and none of the three on its
+  // own does. The leader is the smallest of them, which is how a browser actually looks —
+  // the process named after the app holds almost nothing and the tabs hold everything.
+  const TABLE = {
+    10: { pid: 10, ppid: 1, pgid: 10, rssMB: 300, command: '/Applications/Hog.app/Contents/MacOS/Hog' },
+    11: { pid: 11, ppid: 10, pgid: 10, rssMB: 1400, command: '/Applications/Hog.app/Contents/Frameworks/Helper' },
+    12: { pid: 12, ppid: 10, pgid: 10, rssMB: 1200, command: '/Applications/Hog.app/Contents/Frameworks/Helper' },
+    20: { pid: 20, ppid: 1, pgid: 20, rssMB: 1500, command: '/usr/bin/lonely' }
+  };
+  const totals = (t) => Object.values(t).reduce((acc, p) => {
+    acc[p.pgid] = (acc[p.pgid] || 0) + p.rssMB; return acc;
+  }, {});
+
+  it('names the heaviest group after the app, not after a helper process', () => {
+    assert.deepEqual(pd.topConsumer(TABLE, totals(TABLE)), { pgid: 10, rss: 2900, name: 'Hog' });
+  });
+
+  it('falls back to the heaviest member when the group leader has already exited', () => {
+    // A group outlives its leader, and a group with no name in the notice is no better
+    // than the notice that never looked.
+    const orphaned = Object.assign({}, TABLE);
+    delete orphaned[10];
+    assert.equal(pd.topConsumer(orphaned, totals(orphaned)).pgid, 10);
+    assert.equal(pd.topConsumer(orphaned, totals(orphaned)).name, 'Hog');
+  });
+
+  it('does not fall over on an empty machine', () => {
+    assert.equal(pd.topConsumer({}, {}), null);
   });
 });
 
