@@ -1066,6 +1066,26 @@ function stopCommand(label) {
   return brew ? `brew services stop ${brew[1]}` : `launchctl bootout gui/$(id -u)/${label}`;
 }
 
+/** What actually restarts a launchd job, and the reason restarting one is offered here
+    at all when stopping one isn't.
+ *
+ *  PortDash's own restart is a stop followed by a start, which on a supervised job is
+ *  two mistakes: the stop doesn't stick, and launchd has the job back before the start
+ *  runs, so the start puts a second copy on top of the first. kickstart is not that
+ *  shape. launchd stops its own instance and brings up the replacement itself, as one
+ *  operation, so there is no gap for anyone to race into — which is exactly the case
+ *  the refusal was protecting against. -k is what makes it stop the instance that is
+ *  already running, and it stops it with SIGTERM, so the job gets to shut down properly.
+ *
+ *  Homebrew is deliberately not special-cased the way it is in stopCommand(). There the
+ *  wrapper does something bootout doesn't — it also stops the job coming back at the
+ *  next login — and that difference is worth naming. A restart has no second half to get
+ *  wrong: the job is running and is meant to still be running afterwards, which is all
+ *  of what kickstart does. */
+function restartCommand(label) {
+  return `launchctl kickstart -k gui/$(id -u)/${label}`;
+}
+
 /** Who is responsible for starting and stopping this process. */
 function ownerOf(pid, byPid, jobs) {
   const up = ancestors(pid, byPid);
@@ -1083,7 +1103,10 @@ function ownerOf(pid, byPid, jobs) {
     if (/^application\./.test(label)) return { kind: 'app', label: procName((byPid[p] || {}).command) };
     // Apple's own agents are listed like anything else and would otherwise be handed a
     // perfectly correct command for switching off part of the system until next login.
-    return { kind: 'launchd', label, stop: stopCommand(label), system: /^com\.apple\./.test(label) };
+    return {
+      kind: 'launchd', label, stop: stopCommand(label), restart: restartCommand(label),
+      system: /^com\.apple\./.test(label)
+    };
   }
   // An executable that lives inside an app bundle is that app, whether or not launchd
   // has a record of it. A helper whose parent has since exited would otherwise be
@@ -1560,9 +1583,45 @@ const waitGone = (pid, ms) => new Promise((resolve) => {
   tick();
 });
 
+/** Ask launchd to restart one of its jobs, and answer with the pid it started (-p prints
+    it). Nothing here signals anything itself: the point of going through launchd is that
+    the stop and the start are its single operation rather than two of ours.
+ *
+ *  launchctl's own complaint is passed through because it is the only thing that can
+ *  explain the failure anyone will actually hit — the job was booted out somewhere
+ *  between this page being drawn and the button being pressed, and the label the row is
+ *  still showing now refers to nothing ("Could not find service ... in domain"). */
+function kickstartJob(label) {
+  let out;
+  try {
+    out = execFileSync('launchctl', ['kickstart', '-kp', `gui/${process.getuid()}/${label}`],
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, encoding: 'utf8' });
+  } catch (e) {
+    const why = String((e && (e.stderr || e.message)) || '').trim();
+    throw new Error(`launchd wouldn't restart ${label}${why ? ': ' + why : ''}`);
+  }
+  invalidate();                      // a different process is serving this port now
+  const pid = Number(String(out).trim());
+  return Number.isInteger(pid) && pid > 1 ? pid : null;
+}
+
 async function restartProject(id) {
   const p = getReg().find((x) => x.id === id);
   if (!p) throw new Error('Project not found');
+
+  const st = buildState(true).projects.find((x) => x.id === id);
+  refuseSelf(st);
+
+  // Handed straight to launchd, and before the start-command check rather than after it:
+  // a supervised job is the one kind of project that doesn't need PortDash to know how to
+  // start it, because launchd does. Requiring a command here would refuse the restart on
+  // exactly the rows that can carry it out most safely. refuseSystemAgent is the same
+  // guard the signalling routes use — restarting the menu bar is no better than stopping
+  // it, and this route reaches the same jobs.
+  if (st && st.owner && st.owner.kind === 'launchd') {
+    refuseSystemAgent(st.owner, st.pid);
+    return { pid: kickstartJob(st.owner.label), via: 'launchd', label: st.owner.label };
+  }
 
   // Checked before anything is stopped, because restart is stop-then-start and the
   // start is the half that fails. Without this, pressing Restart on a project with no
@@ -1572,14 +1631,6 @@ async function restartProject(id) {
     throw new Error(`"${p.name}" has no start command, so it can't be restarted — it would be stopped and not come back. Click "Edit" and set one, or use "Stop" if that's what you meant.`);
   }
 
-  const st = buildState(true).projects.find((x) => x.id === id);
-  refuseSelf(st);
-
-  // Stopping something launchd supervises doesn't stop it; it comes straight back, and
-  // then this would start a second copy alongside it.
-  if (st && st.owner && st.owner.kind === 'launchd') {
-    throw new Error(`"${p.name}" is supervised by launchd as ${st.owner.label}, so restarting it here would stop it, let launchd bring it back, and then start a second copy on top. Run: ${st.owner.stop}`);
-  }
   if (st && st.pid) {
     signalGroup(st.pgid, 'SIGCONT');
     signalGroup(st.pgid, 'SIGTERM');
@@ -2169,6 +2220,13 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     and it looks like nothing happened. Run this in a terminal instead:
   </div>
   <pre id="s_cmd" style="max-height:none"></pre>
+  <!-- Most people who press Stop on a supervised dev server are not trying to switch it
+       off, they are trying to make it pick up a code change, and until now this dialog
+       answered the question they typed rather than the one they had. -->
+  <div class="sub" id="s_restart" hidden style="font-size:13px;margin-top:10px">
+    If you only want it to pick up a code change, "Restart" on the row does that instead —
+    launchd stops this copy and starts a fresh one, and nothing is left switched off.
+  </div>
   <div class="sub" id="s_sys" hidden style="font-size:13px;margin-top:10px;color:var(--danger)">
     This is one of macOS's own agents, not a dev server. That command works, but it switches
     off part of the system until you log in again — it's almost certainly not what you want.
@@ -2293,6 +2351,10 @@ function ownerTag(o){
 let supTarget=null;
 function showSup(o,target){
   supTarget=target; s_who.textContent=o.label; s_cmd.textContent=o.stop;
+  // Only on a project row: that is where the Restart button being pointed at exists.
+  // The rows under "other ports in use" aren't registered and have no lifecycle buttons,
+  // so there it would be directing someone to something that isn't on their screen.
+  s_restart.hidden=!(target&&target.id)||!!o.system;
   s_sys.hidden=!o.system; sup.showModal();
 }
 async function copyCmd(){
@@ -2368,11 +2430,19 @@ function projectRow(p){
     ? btn('supervised',p.id,'Stop…','d','Something else supervises this — see what actually stops it')
     : btn('stop',p.id,'Stop','d','Stop it and give back its memory and its ports.');
   // Restart is stop-then-start, so it is only an offer PortDash can keep when it knows
-  // how to start the thing and nothing else is going to beat it to it. On a launchd job
-  // it would stop the service, watch launchd bring it back, and start a second copy; on
-  // a project with no start command it would stop the service and fail. The server
-  // refuses both, and a button that can only produce an error shouldn't be there at all.
-  const canRestart=!!p.cmd && !(p.owner&&p.owner.kind==='launchd');
+  // how to start the thing: with no start command it would stop the service and fail,
+  // and a button that can only produce an error shouldn't be there at all.
+  //
+  // A launchd job goes the other way, and it is the row that wanted this button most —
+  // it is the one you can't just stop and start yourself. PortDash doesn't restart it,
+  // it asks launchd to, which is one operation and so can't leave two copies behind; a
+  // start command isn't needed because launchd is holding it. Apple's own agents stay
+  // out: restarting the menu bar is no more wanted than stopping it.
+  const byLaunchd=!!(p.owner&&p.owner.kind==='launchd');
+  const canRestart=byLaunchd?!p.owner.system:!!p.cmd;
+  const restartTip=byLaunchd
+    ?'Hand it back to launchd: it stops this copy and starts a fresh one, which is how it picks up your code changes. Same as running '+p.owner.restart
+    :'Stop it and start it again.';
   let acts='';
   // The self row gets no lifecycle buttons: whatever supervises PortDash owns them.
   if(p.source==='self') acts=openBtn;
@@ -2383,7 +2453,7 @@ function projectRow(p){
   else if(p.status==='running')
     acts=openBtn
       +btn('pause',p.id,'Pause','','Freeze it where it is. Its memory and ports stay held and requests will hang — Stop is what gives them back.')
-      +(canRestart?btn('restart',p.id,'Restart'):'')+stopBtn;
+      +(canRestart?btn('restart',p.id,'Restart','',restartTip):'')+stopBtn;
   else acts=btn('resume',p.id,'Resume','p','Unfreeze it and let it carry on from where it stopped.')+stopBtn;
   acts+='<span class="sep"></span>'+pinBtn(p)
     +iconBtn('logs',p.id,ICON.logs,'Logs')
@@ -2706,7 +2776,7 @@ Config, logs and the API token live in ~/.portdash/`);
  * rather than depend on whatever this particular machine happens to be running.
  */
 module.exports = {
-  procName, ancestors, ownerOf, stopCommand, launchdJobs,
+  procName, ancestors, ownerOf, stopCommand, restartCommand, launchdJobs,
   isPortdash, supersededBy, strayOrigin, stopStray, topConsumer,
   detectProject, staticCmd, freeStaticPort, idOf, registrable, scanProjects,
   diagnose, missingCommand, lastLine, syncedFolder,

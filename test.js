@@ -101,11 +101,12 @@ describe('who owns a process', () => {
     assert.ok(pd.ancestors(40, TREE).length <= 2);
   });
 
-  it('names a launchd job and the command that actually stops it', () => {
+  it('names a launchd job and the commands that actually stop and restart it', () => {
     assert.deepEqual(pd.ownerOf(20, TREE, { 20: 'homebrew.mxcl.postgresql@16' }), {
       kind: 'launchd',
       label: 'homebrew.mxcl.postgresql@16',
       stop: 'brew services stop postgresql@16',
+      restart: 'launchctl kickstart -k gui/$(id -u)/homebrew.mxcl.postgresql@16',
       system: false
     });
   });
@@ -176,6 +177,18 @@ describe('who owns a process', () => {
   it('turns a Homebrew label into the command a Homebrew user already knows', () => {
     assert.equal(pd.stopCommand('homebrew.mxcl.postgresql@16'), 'brew services stop postgresql@16');
     assert.equal(pd.stopCommand('com.example.thing'), 'launchctl bootout gui/$(id -u)/com.example.thing');
+  });
+
+  it('restarts every launchd job the same way, Homebrew included', () => {
+    // The asymmetry with stopCommand() is on purpose and looks like an oversight.
+    // `brew services stop` earns its special case by doing something bootout doesn't:
+    // it also stops the job coming back at the next login. A restart has no equivalent
+    // second half — the job is running and is meant to still be running afterwards —
+    // so there is nothing for a wrapper to add, and one command covers both.
+    assert.equal(pd.restartCommand('local.salesos-console.preview'),
+                 'launchctl kickstart -k gui/$(id -u)/local.salesos-console.preview');
+    assert.equal(pd.restartCommand('homebrew.mxcl.postgresql@16'),
+                 'launchctl kickstart -k gui/$(id -u)/homebrew.mxcl.postgresql@16');
   });
 });
 
