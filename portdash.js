@@ -437,6 +437,31 @@ function dropAlert(key) {
 }
 
 /**
+ * Withdraw everything said about one project, because it has just been told to do
+ * something different.
+ *
+ * Every notice about a project describes the state it was in: it wouldn't start, it was
+ * frozen for using too much, it was killed for using far too much. Start it, resume it,
+ * stop it, and all of those are about a project that no longer exists in that form.
+ *
+ * The notice that announced a freeze has always carried its own Resume, and pressing that
+ * one took the notice with it. The frozen row is sitting right there with a Resume button
+ * of its own, though, and that is the one a hand reaches for — after which the row says
+ * running and a red notice above it still says the thing was frozen. Same for a start
+ * that failed on a missing command: fix the PATH, press Start, watch it come up, and the
+ * complaint about the PATH stays on screen.
+ *
+ * Matched on projectId rather than on a list of key prefixes, so a notice added later is
+ * covered by having been tagged with the project it is about, which it has to be anyway
+ * to reach that project's log.
+ */
+function clearProjectAlerts(id) {
+  if (!id) return;
+  for (const a of alerts) if (a.projectId === id) delete alertSeen[a.key];
+  alerts = alerts.filter((a) => a.projectId !== id);
+}
+
+/**
  * A notice about a condition rather than an event, kept as one row for as long as the
  * condition lasts.
  *
@@ -1413,7 +1438,10 @@ function startProject(id) {
   // --- Refuse to start anything new while the system is already tight on memory ---
   const sm = sysMem();
   if (lim.enabled && sm && sm.availPct < lim.sysAvailFloorPct) {
-    throw new Error(`Only ${sm.availPct}% memory available — stop something first`);
+    // The process table is only taken on the path that refuses, so the normal start still
+    // costs one vm_stat and nothing else.
+    const { byPid, rssByPgid } = procs(true);
+    throw new Error(tooTightToStart(sm.availPct, topConsumer(byPid, rssByPgid)));
   }
 
   ensure();
@@ -1602,6 +1630,16 @@ const SYS_STANDING = ['sys:none', 'sys:small'];
  *   - it isn't → name what is, because freeing that is what will actually help
  *   - nothing to compare against → the old wording, which is at least not wrong
  */
+/** Why a start was refused for lack of memory, and what to do about it. "Stop something
+    first" is the same dead end freezeAdvice was: the reader knows they have to stop
+    something, and which one is the part they came here to find out. This is a refusal, so
+    it is the only thing they get — there is no row and no log to go and read afterwards. */
+function tooTightToStart(availPct, top) {
+  const base = `Only ${availPct}% memory available, so starting another service now would make it worse.`;
+  return top ? `${base} ${top.name} is holding ${fmtMB(top.rss)} — free some of that, then try again.`
+             : `${base} Stop something first.`;
+}
+
 function freezeAdvice(top, topIsVictim) {
   if (!top) return ' Close something else, then resume it.';
   if (topIsVictim) {
@@ -1753,6 +1791,14 @@ function json(res, code, data) {
   res.end(b);
 }
 
+/** Answer a lifecycle call that has just succeeded, and retire what was said about the
+    project before it. One helper so the clearing can't be added to four routes and
+    forgotten on the fifth. */
+function done(res, result, id) {
+  clearProjectAlerts(id);
+  return json(res, 200, result);
+}
+
 const readBody = (req) => new Promise((resolve) => {
   let s = '';
   req.on('data', (c) => { s += c; });
@@ -1839,12 +1885,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST') {
       const body = await readBody(req);
       if (u.pathname === '/api/scan')    return json(res, 200, scanProjects());
-      if (u.pathname === '/api/start')   return json(res, 200, startProject(body.id));
-      if (u.pathname === '/api/stop')    return json(res, 200, stopTarget(body));
+      // Every one of these five replaces the state a project's notices were about, so
+      // they clear them — after the call, never before, since these all throw rather than
+      // return when they refuse, and a refusal changes nothing to withdraw notices for.
+      // Guarded on body.id inside the helper: Stop, Pause and Resume also take a raw pid,
+      // for the rows that aren't projects at all.
+      if (u.pathname === '/api/start')   return done(res, startProject(body.id), body.id);
+      if (u.pathname === '/api/stop')    return done(res, stopTarget(body), body.id);
       if (u.pathname === '/api/stop-stray') return json(res, 200, stopStray(body));
-      if (u.pathname === '/api/restart') return json(res, 200, await restartProject(body.id));
-      if (u.pathname === '/api/pause')   return json(res, 200, { ok: signalGroup(resolveTarget(body).pgid, 'SIGSTOP') });
-      if (u.pathname === '/api/resume')  return json(res, 200, { ok: signalGroup(resolveTarget(body).pgid, 'SIGCONT') });
+      if (u.pathname === '/api/restart') return done(res, await restartProject(body.id), body.id);
+      if (u.pathname === '/api/pause')   return done(res, { ok: signalGroup(resolveTarget(body).pgid, 'SIGSTOP') }, body.id);
+      if (u.pathname === '/api/resume')  return done(res, { ok: signalGroup(resolveTarget(body).pgid, 'SIGCONT') }, body.id);
       if (u.pathname === '/api/dismiss') { alerts = alerts.filter((a) => a.id !== body.alertId); return json(res, 200, { ok: true }); }
       if (u.pathname === '/api/recheck-env') {
         const e = refreshEnv();
@@ -2662,10 +2713,10 @@ module.exports = {
   etimeToSec, sameProcess, processTable, listeners, sysMem,
   whichIn, envSummary, doctor,
   buildState, procs, ports, invalidate,
-  probe, healthFor, roomierLimit, MIN_LIMIT_MB, refuseSystemAgent, freezeAdvice,
+  probe, healthFor, roomierLimit, MIN_LIMIT_MB, refuseSystemAgent, freezeAdvice, tooTightToStart,
   getAlerts: () => alerts,
   resetAlerts: () => { alerts = []; for (const k of Object.keys(alertSeen)) delete alertSeen[k]; },
-  standingAlert, dropAlert,
+  standingAlert, dropAlert, clearProjectAlerts, alert_,
   _caches: { rootSeen, sibSaid, health, speaksHttp }
 };
 

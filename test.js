@@ -390,6 +390,51 @@ describe('naming what is actually eating the memory', () => {
   it('keeps the old wording when it has nothing to compare against', () => {
     assert.match(pd.freezeAdvice(null, false), /Close something else/);
   });
+
+  it('names it in the refusal to start, too — that one has nowhere else to look', () => {
+    // A refused start is a single line in a toast. There is no row to inspect and no log
+    // to open afterwards, so "stop something first" is the whole of what the person gets.
+    assert.match(pd.tooTightToStart(8, { pgid: 10, rss: 6553, name: 'ChatGPT' }),
+                 /ChatGPT is holding 6\.4G/);
+    assert.match(pd.tooTightToStart(8, null), /Stop something first/);
+  });
+});
+
+describe('what a project has been told about itself', () => {
+  const at = (id, key) => pd.alert_('danger', 'something about ' + id, id, key);
+
+  it('forgets it once the project is told to do something different', () => {
+    // The notice announcing a freeze carries its own Resume, and pressing that took the
+    // notice with it. But the frozen row is sitting right there with a Resume of its own,
+    // and that is the one a hand reaches for — after which the row says running and a red
+    // notice above it still says the thing is frozen.
+    pd.resetAlerts();
+    at('app', 'soft:app');
+    at('app', 'exit:app');
+    at('other', 'soft:other');
+    pd.clearProjectAlerts('app');
+    assert.deepEqual(pd.getAlerts().map((a) => a.key), ['soft:other']);
+  });
+
+  it('lets the same thing be said again straight away', () => {
+    // Start it, watch it fail on the same missing command a second later: that is a new
+    // fact and has to be allowed through. The minute-long dedupe window would eat it.
+    pd.resetAlerts();
+    at('app', 'exit:app');
+    pd.clearProjectAlerts('app');
+    at('app', 'exit:app');
+    assert.equal(pd.getAlerts().length, 1);
+  });
+
+  it('is not fooled into clearing everything by a call with no project', () => {
+    // Stop, Pause and Resume also take a raw pid, for rows that are not projects. Those
+    // alerts carry no projectId, and a null id must not match them.
+    pd.resetAlerts();
+    at('app', 'soft:app');
+    pd.standingAlert('warn', 'the machine is busy', 'sys:none');
+    pd.clearProjectAlerts(null);
+    assert.equal(pd.getAlerts().length, 2);
+  });
 });
 
 // ---------------------------------------------------------------------- ports

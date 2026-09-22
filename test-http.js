@@ -455,6 +455,43 @@ describe('a running PortDash', () => {
     }
   });
 
+  it('drops what it said about a failed start once the project comes up', async () => {
+    // The notice is right when it is posted and wrong a minute later: you read "npm isn't
+    // on the PATH", fix the PATH, press Start, watch the row go green — and the complaint
+    // about the PATH is still sitting above it in red. Nothing used to take it down but
+    // the × , and a notice you have to tidy up after teaches you to ignore notices.
+    const dir = path.join(HOME, 'flaky');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'server.js'), 'setInterval(() => {}, 1e9);\n');
+    const reg = registry();
+    reg.push({ id: 'flaky', name: 'flaky', cwd: dir, cmd: 'definitely-not-a-real-command',
+               kind: 'node', port: null, memMB: null, heapMB: null, pinned: false });
+    setRegistry(reg);
+
+    try {
+      await start('flaky');
+      // The diagnosis comes from watching the child die, so it lands a moment after the
+      // start call has already answered 200.
+      let said = null;
+      for (let i = 0; i < 40 && !said; i++) {
+        await sleep(200);
+        said = (await state()).alerts.find((a) => a.projectId === 'flaky');
+      }
+      assert.ok(said, 'a start that fails should say why');
+      assert.match(said.text, /not-a-real-command/);
+
+      // Now fix it, the way somebody would, and start it for real.
+      setRegistry(registry().map((p) => (p.id === 'flaky' ? Object.assign({}, p, { cmd: 'node server.js' }) : p)));
+      await start('flaky');
+      assert.equal((await state()).alerts.filter((a) => a.projectId === 'flaky').length, 0,
+                   'the complaint about the old command should not outlive it');
+      assert.ok((await until('flaky', (x) => x.pid)).pid);
+    } finally {
+      await post('/api/stop', { id: 'flaky' });
+      setRegistry(registry().filter((p) => p.id !== 'flaky'));
+    }
+  });
+
   it('refuses to restart something it has no way to start again, without stopping it', async () => {
     // Restart is stop-then-start, and the start is the half that fails. Before the guard
     // this stopped the service and handed back an error: the button took the thing away.
