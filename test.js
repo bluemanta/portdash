@@ -467,6 +467,79 @@ describe('a port for every static site', () => {
   });
 });
 
+// ------------------------------------------ which process a project row is
+
+describe('deciding which process a project row stands for', () => {
+  // One checkout, two servers: an environment left up all day on 3002 and a test one on
+  // 3001. Nothing in the process table distinguishes them except the port.
+  const DIR = '/x/console';
+  const L = [{ pid: 300, port: 3002 }, { pid: 100, port: 3001 }];   // lsof's order, not ours
+  const C = { 100: DIR, 300: DIR };
+  const BY = { 100: { pid: 100, pgid: 100 }, 300: { pid: 300, pgid: 300 } };
+  const bind = (reg) => pd.bindProjects(reg, L, C, BY);
+  const proj = (id, port) => ({ id, name: id, cwd: DIR, port });
+
+  it('binds each row to the server on its own recorded port', () => {
+    // THE BUG THIS EXISTS FOR. Matching on the directory alone took whichever listener
+    // came first, so the test row showed the all-day environment: its memory, its
+    // uptime, its address — under the other project's name, with a Stop button that
+    // stopped it. Which one you got depended on the order lsof happened to print.
+    const b = bind([proj('test', 3001), proj('local', 3002)]);
+    assert.equal(b.test.pid, 100);
+    assert.equal(b.local.pid, 300);
+  });
+
+  it('gives the same answer whichever order the registry is in', () => {
+    const b = bind([proj('local', 3002), proj('test', 3001)]);
+    assert.equal(b.test.pid, 100);
+    assert.equal(b.local.pid, 300);
+  });
+
+  it('will not let a sibling with no port take one that is spoken for', () => {
+    // The pass order is what stops this: every project that names its port is served
+    // before anything falls back to matching on the directory. Registered first and
+    // matched first, the vague one would otherwise take 3001 and leave the project that
+    // actually asked for 3001 reading "stopped".
+    const b = bind([proj('vague', null), proj('test', 3001)]);
+    assert.equal(b.test.pid, 100);
+    assert.equal(b.vague.pid, 300);
+  });
+
+  it('still finds a lone project by its directory, port or no port', () => {
+    // The fallback is not a leftover. Most projects have no port recorded, and being
+    // found by directory is the only reason PortDash sees a server you started yourself.
+    assert.ok(bind([proj('solo', null)]).solo.pid);
+    // And a recorded port stays a prediction rather than a requirement: a project told
+    // 3001 that is actually up on 3002 is still that project, not a stopped one.
+    assert.equal(bind([proj('solo', 9999)]).solo.pid, 300);
+  });
+
+  it('hands each process to one row only', () => {
+    // Two rows showing the same pid is the original ambiguity with somewhere to hide.
+    const b = bind([proj('a', null), proj('b', null), proj('c', null)]);
+    const pids = Object.values(b).map((x) => x.pid);
+    assert.equal(new Set(pids).size, pids.length);
+    assert.equal(pids.length, 2, 'and the third has nothing left to be');
+  });
+});
+
+describe('giving a second project in one directory an id of its own', () => {
+  it('leaves the first one exactly as it was', () => {
+    // An id names the log file, the pin and the record of what PortDash started. Deriving
+    // it from directory-and-port would be tidier and would rename every project on the
+    // machine, losing all three.
+    const first = pd.idOf('/x/console');
+    assert.equal(pd.freeId([], '/x/console', 3001), first);
+    assert.equal(pd.freeId([{ id: first }], '/x/console', 3002), first + '-3002');
+  });
+
+  it('keeps going if that one is taken too', () => {
+    const first = pd.idOf('/x/console');
+    const reg = [{ id: first }, { id: first + '-3002' }];
+    assert.equal(pd.freeId(reg, '/x/console', 3002), first + '-3002-2');
+  });
+});
+
 // ------------------------------------------------- explaining a failed start
 
 describe('explaining a start that failed', () => {

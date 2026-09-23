@@ -518,6 +518,68 @@ describe('a running PortDash', () => {
     started.length = 0;
   });
 
+  it('gives a second server in the same directory a row of its own', async () => {
+    // One checkout, two long-lived servers — an environment kept up all day and a test
+    // one beside it — used to be unrepresentable: a directory was allowed one project,
+    // so the second server was refused registration and sat in "other ports in use"
+    // forever, while the one row that did exist attached itself to whichever of the two
+    // lsof listed first and moved between them without saying so.
+    const SECOND = await freePort();
+    const dir = path.join(HOME, 'fixture-app');
+    fs.writeFileSync(path.join(dir, 'second.js'),
+      `require('http').createServer((q, s) => s.end('ok')).listen(${SECOND}, '127.0.0.1');\n`);
+
+    await start('fixture-app');
+    await until('fixture-app', (x) => x.ports.includes(APP));
+    const extra = spawn(process.execPath, ['second.js'], { cwd: dir, detached: true, stdio: 'ignore' });
+    extra.unref();
+    started.push(extra.pid);
+    for (let i = 0; i < 40; i++) {
+      if ((await state()).others.some((o) => o.ports.includes(SECOND))) break;
+      await sleep(250);
+    }
+
+    const r = await post('/api/register', { cwd: dir, port: SECOND });
+    assert.equal(r.code, 200, r.body);
+
+    const all = (await state()).projects.filter((p) => p.cwd === dir);
+    assert.equal(all.length, 2, 'both servers should now have a row');
+    const first = all.find((p) => p.id === 'fixture-app');
+    const second = all.find((p) => p.id !== 'fixture-app');
+
+    // Named apart, because two rows reading "fixture-app" is a puzzle to solve on sight.
+    assert.equal(second.name, 'fixture-app:' + SECOND);
+    // And, the point of the whole thing: each row is the server on its own port, so the
+    // buttons on it act on that one.
+    assert.deepEqual(first.ports, [APP]);
+    assert.deepEqual(second.ports, [SECOND]);
+    assert.notEqual(first.pid, second.pid);
+
+    // What still can't be repeated is the address: two entries for one directory and one
+    // port are two names for a single service, and nothing downstream could tell which
+    // was meant.
+    const dup = await post('/api/register', { cwd: dir, port: SECOND });
+    assert.equal(dup.code, 400);
+    assert.match(JSON.parse(dup.body).error, /already registered/);
+
+    // The Edit dialog is the other way into the registry and keeps the same rule, or the
+    // ambiguity comes back by a different door.
+    const cleared = await post('/api/save', { id: second.id, name: second.name, cmd: 'node second.js', port: '' });
+    assert.equal(cleared.code, 400);
+    assert.match(JSON.parse(cleared.body).error, /needs a port/);
+    const taken = await post('/api/save', { id: second.id, name: second.name, cmd: 'node second.js', port: String(APP) });
+    assert.equal(taken.code, 400);
+    assert.match(JSON.parse(taken.body).error, /already/);
+
+    await post('/api/remove', { id: second.id });
+    try { process.kill(-extra.pid, 'SIGKILL'); } catch (e) { /* already gone */ }
+    started.splice(started.indexOf(extra.pid), 1);
+    fs.rmSync(path.join(dir, 'second.js'), { force: true });
+    await post('/api/stop', { id: 'fixture-app' });
+    await until('fixture-app', (x) => x.status === 'stopped');
+    started.length = 0;
+  });
+
   it('remembers that a project should never be frozen automatically', async () => {
     // The escape hatch for something that legitimately gets heavy. Before it existed the
     // only way out was typing a number large enough to never be reached, which is a

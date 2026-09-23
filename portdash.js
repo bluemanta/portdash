@@ -388,6 +388,22 @@ function idOf(cwd) {
   return `${base}-${h}`;
 }
 
+/** An id derived from the directory was unique for as long as a directory meant one
+    project. Now that it can hold two, the second one needs a different id — and the
+    first one needs the id it already has. An id is not just a key: it names the log file
+    under logs/, the entry in the record of what PortDash started, and the pin. Deriving
+    ids from directory-and-port instead would have been tidier and would have renamed
+    every project on the machine, losing all three. So the port is appended only by the
+    entry that would otherwise collide, and nothing already registered moves. */
+function freeId(reg, cwd, port) {
+  const base = idOf(cwd);
+  const used = new Set(reg.map((x) => x.id));
+  if (!used.has(base)) return base;
+  let id = `${base}-${port}`;
+  for (let n = 2; used.has(id); n++) id = `${base}-${port}-${n}`;
+  return id;
+}
+
 function getCfg() {
   const raw = readJSON(F_CFG, {});
   const cfg = Object.assign({}, DEFAULT_CFG, raw);
@@ -1295,6 +1311,65 @@ function invalidate() { procSample = portSample = null; }
 
 // ---------------------------------------------------------------- state aggregation
 
+/**
+ * Which running process each registered project is, decided for all of them at once.
+ *
+ * Matching used to be one line inside the row loop: the first listener whose working
+ * directory equals the project's. That was right while a directory meant a server, and
+ * wrong the moment it doesn't. Running two out of the same checkout is an ordinary
+ * setup — one environment kept up all day, a second for testing on another port — and
+ * then "the first listener" means whichever of them lsof happened to list first. Nothing
+ * about that is stable. The row stood for one service in the morning and the other one
+ * after a restart, showing the other one's memory, uptime and address, while still
+ * carrying the project's name; and Stop, Pause and Restart went with it. A button that
+ * silently changes which service it acts on is the part that actually costs something.
+ *
+ * So: the recorded port decides, and it is already the field that means "the address
+ * PortDash means by this project" — the one it opens, pins and probes. Everything else
+ * is unchanged, because the great majority of projects have no port recorded and being
+ * found by directory alone is the whole reason PortDash can see them at all.
+ *
+ * Three passes rather than one, because the answer must not depend on the order projects
+ * happen to sit in the registry:
+ *
+ *   1. The ones that aren't in question. PortDash itself, and anything PortDash started
+ *      and still has a record of — those are facts, not deductions.
+ *   2. Every project whose recorded port is actually being listened on. A project that
+ *      names its port has a better claim to a process than one that only matches the
+ *      directory, whichever of them is listed first.
+ *   3. The rest, by directory, as before.
+ *
+ * Claims are tracked by process group, and each one is only handed out once. Two
+ * projects sharing a directory can then never be shown as the same process — which,
+ * without this, is exactly what a sibling with no port recorded would do: fall back to
+ * the first match and take the process its neighbour is already displaying, putting the
+ * old ambiguity back with two rows to hide it in.
+ */
+function bindProjects(reg, L, C, byPid) {
+  const bind = {};
+  const taken = new Set();
+  const groupOf = (pid) => (byPid[pid] || {}).pgid || pid;
+  const claim = (p, pid, source) => { bind[p.id] = { pid, source }; taken.add(groupOf(pid)); };
+  const mine = (p) => L.filter((r) => !taken.has(groupOf(r.pid)) && realOf(C[r.pid]) === realOf(p.cwd));
+
+  for (const p of reg) {
+    if (realOf(p.cwd) === realOf(SELF_DIR)) { claim(p, process.pid, 'self'); continue; }
+    const m = managed[p.id];
+    if (m && byPid[m.pid]) claim(p, m.pid, 'managed');
+  }
+  for (const p of reg) {
+    if (bind[p.id] || !p.port) continue;
+    const hit = mine(p).find((r) => r.port === p.port);
+    if (hit) claim(p, hit.pid, 'external');
+  }
+  for (const p of reg) {
+    if (bind[p.id]) continue;
+    const hit = mine(p)[0];
+    if (hit) claim(p, hit.pid, 'external');
+  }
+  return bind;
+}
+
 /** `fresh` forces both samples to be retaken. Rendering doesn't need it — a row that is
     up to a second and a half behind is invisible next to a 2.5s poll — but anything
     about to act on a pid does, which is why the callers that signal ask for it. */
@@ -1306,17 +1381,13 @@ function buildState(fresh) {
 
   if (pruneManaged(byPid)) saveManaged();
 
+  const bind = bindProjects(reg, L, C, byPid);
+
   const claimed = new Set();
 
   const projects = reg.map((p) => {
-    let pid = null, source = null;
-    if (realOf(p.cwd) === realOf(SELF_DIR)) { pid = process.pid; source = 'self'; }
-    const m = managed[p.id];
-    if (!pid && m && byPid[m.pid]) { pid = m.pid; source = 'managed'; }
-    if (!pid) {
-      const hit = L.find((r) => realOf(C[r.pid]) === realOf(p.cwd));
-      if (hit) { pid = hit.pid; source = 'external'; }
-    }
+    const b = bind[p.id] || {};
+    let pid = b.pid || null, source = b.source || null;
 
     let status = 'stopped', ports = [], etime = null, pgid = null, rssMB = null;
     if (pid) {
@@ -1960,7 +2031,19 @@ const server = http.createServer(async (req, res) => {
         if (!p) throw new Error('Project not found');
         if (typeof body.name === 'string' && body.name.trim()) p.name = body.name.trim();
         if (typeof body.cmd === 'string') p.cmd = body.cmd.trim();
-        p.port = body.port ? parseInt(body.port, 10) : null;
+        // The same rule /api/register keeps, enforced on the other way into the registry.
+        // Siblings sharing a directory are told apart by their ports and by nothing else,
+        // so clearing one here, or typing a port its neighbour already has, would leave a
+        // pair of rows that can't be assigned a process each — the ambiguity this whole
+        // arrangement exists to remove, arrived at through the Edit dialog instead.
+        const port = body.port ? parseInt(body.port, 10) : null;
+        const sibs = reg.filter((x) => x.id !== p.id && realOf(x.cwd) === realOf(p.cwd));
+        if (sibs.length) {
+          const clash = sibs.find((x) => (x.port || null) === port);
+          if (clash) throw new Error(`"${clash.name}" is this directory's entry for ${port ? `port ${port}` : 'no particular port'} already. Give this one a different port, or remove that one.`);
+          if (!port) throw new Error(`"${p.name}" shares a directory with "${sibs[0].name}", so it needs a port to say which of the two services it is.`);
+        }
+        p.port = port;
         p.memMB = body.memMB ? parseInt(body.memMB, 10) : null;
         p.heapMB = body.heapMB ? parseInt(body.heapMB, 10) : null;
         p.noFreeze = !!body.noFreeze;
@@ -2005,12 +2088,33 @@ const server = http.createServer(async (req, res) => {
         if (!body.cwd) throw new Error("Couldn't determine this process's working directory, can't register it");
         if (!registrable(body.cwd)) throw new Error(`${body.cwd} doesn't look like a project directory — it's a system or sandboxed-app path`);
         const reg = getReg();
-        if (reg.some((x) => realOf(x.cwd) === realOf(body.cwd))) throw new Error('This directory is already registered');
         const d = detectProject(body.cwd) || { name: path.basename(body.cwd), cmd: '', kind: 'unknown' };
         // This one is already listening, so its port is a fact rather than a guess — a
         // generated static command should name that port instead of the generic 8000.
         const port = body.port || (d.kind === 'static' ? freeStaticPort(reg) : null);
-        reg.push({ id: idOf(body.cwd), name: d.name, cwd: body.cwd, kind: d.kind,
+        // A directory used to be allowed exactly one project, which assumed a checkout
+        // runs one server. Plenty don't: an environment left up all day and a test one
+        // beside it on another port are two services that each want their own row, their
+        // own memory limit and their own Stop button. Registering the second one used to
+        // be refused outright, which left it in "other ports in use" with no way out.
+        //
+        // What still can't be repeated is the address. Two entries with the same
+        // directory and the same port are two names for one service, and nothing after
+        // this point — not the matching, not the buttons — could tell which was meant.
+        // That is also why a second entry has to have a port at all: it is the only
+        // thing distinguishing it from the entry already there.
+        const sibs = reg.filter((x) => realOf(x.cwd) === realOf(body.cwd));
+        const clash = sibs.find((x) => (x.port || null) === (port || null));
+        if (clash) throw new Error(`This directory is already registered as "${clash.name}"${port ? ` on port ${port}` : ''}.`);
+        if (sibs.length && !port) {
+          throw new Error(`This directory is already registered as "${sibs[0].name}". A second entry for it needs a port of its own — that is the only thing that would tell the two apart.`);
+        }
+        reg.push({ id: freeId(reg, body.cwd, port),
+                   // Two rows reading "salesos-console" would be a puzzle to solve every
+                   // time. Only the newcomer is renamed: the existing row is something
+                   // the user may well have named themselves.
+                   name: sibs.length ? `${d.name}:${port}` : d.name,
+                   cwd: body.cwd, kind: d.kind,
                    cmd: (d.kind === 'static' && port) ? staticCmd(port) : d.cmd,
                    port, memMB: null, heapMB: null, pinned: false });
         setReg(reg);
@@ -2778,7 +2882,7 @@ Config, logs and the API token live in ~/.portdash/`);
 module.exports = {
   procName, ancestors, ownerOf, stopCommand, restartCommand, launchdJobs,
   isPortdash, supersededBy, strayOrigin, stopStray, topConsumer,
-  detectProject, staticCmd, freeStaticPort, idOf, registrable, scanProjects,
+  detectProject, staticCmd, freeStaticPort, idOf, freeId, bindProjects, registrable, scanProjects,
   diagnose, missingCommand, lastLine, syncedFolder,
   etimeToSec, sameProcess, processTable, listeners, sysMem,
   whichIn, envSummary, doctor,
